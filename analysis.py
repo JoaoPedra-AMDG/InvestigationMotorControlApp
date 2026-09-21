@@ -2,7 +2,7 @@
 import math
 import numpy as np
 
-VERSION = '3.0.0'
+VERSION = '3.1.0'
 
 
 def wrap_degrees(x):
@@ -83,6 +83,8 @@ def analyze(rows, metadata, settings=None):
     if timing['gap_count'] or timing.get('sequence_missing'):
         flag('timing_gaps', 'Missing samples or timing gaps; no interpolation performed.', 'error')
     if invalid_time:return result
+    if metadata.get('capture_interrupted'):
+        flag('capture_interrupted', 'Capture was interrupted or its paired acquisition failed.', 'error')
     if acquisition.get('partial'):
         flag('partial_capture', 'Capture ended before the requested post-trigger window completed.', 'error')
     if acquisition.get('actual_pre_s', 1) + .001 < acquisition.get('requested_pre_s', 0):
@@ -213,8 +215,12 @@ def analyze(rows, metadata, settings=None):
                     for name,a in zip(('ia','ib','ic'),phases):
                         coef = np.linalg.lstsq(basis,a,rcond=None)[0]
                         residual = a-basis@coef
-                        metrics[name+'_residual_a'] = {'rms':float(np.sqrt(np.mean(residual**2))), 'peak_to_peak':float(np.ptp(residual)),
+                        metrics[name+'_residual_a'] = {'rms':float(np.sqrt(np.mean(residual**2))), 'peak_to_peak':float(np.ptp(residual)), 'abs_peak':float(np.max(np.abs(residual))),
                             'bandwidth_hz':bandwidth, 'method':'Least-squares DC + sin/cos fundamental removed; no per-run angle bias fit.'}
+                        derived[name+'_residual_a']=residual.tolist()
+                    metrics['maximum_current_ripple_a']={'peak_to_peak':max(metrics[n+'_residual_a']['peak_to_peak'] for n in ('ia','ib','ic')),
+                        'abs_peak':max(metrics[n+'_residual_a']['abs_peak'] for n in ('ia','ib','ic')),
+                        'definition':'Largest phase residual after DC + fitted fundamental removal; within declared acquisition bandwidth.'}
         else:
             flag('fundamental_unknown','Provide synchronized calibrated encoder angle or a justified constant fundamental frequency.')
     elif not phase_available:

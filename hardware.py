@@ -5,7 +5,8 @@ https://docs.odriverobotics.com/v/latest/fibre_types/com_odriverobotics_ODrive.h
 https://docs.odriverobotics.com/v/latest/guides/python-package.html
 https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless
 
-Only the owner thread accesses boards. No synthetic runtime fallback. Injected
+Motion and polling use the owner thread. Finite capture downloads use the official
+synchronous, thread-safe helper off that thread. No synthetic runtime fallback. Injected
 connectors are reserved for unit tests and never exposed through the web API.
 """
 import copy
@@ -18,6 +19,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeout
+from capture_runtime import CaptureService,inspect_capture
 
 DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     max_speed_rpm=0., max_load_a=0., test_direction=1, load_direction=-1,
@@ -26,7 +28,8 @@ DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     axis_units_verified=False, startup_timeout_s=15., encoder_reference_path='',
     encoder_reference_scale_rad=None, encoder_reference_verified=False,
     encoder_speed_path='', encoder_speed_scale_rpm=None,
-    calibration=dict(verified=False,id='',pole_pairs=None,offset_rad=None,encoder_direction=1))
+    calibration=dict(verified=False,id='',pole_pairs=None,offset_rad=None,encoder_direction=1),
+    capture_bandwidth_hz=None,capture_filtering='')
 SIGNAL_PATHS = {
     'dc_voltage_v': ('vbus_voltage', 'V', 'measured'),
     'dc_current_a': ('ibus', 'A', 'estimated'),
@@ -152,6 +155,7 @@ class HardwareController:
         self._sample_id, self._acquired_at = 0, None
         self._package = installed()
         self._owned_motion = False
+        self.capture_service=CaptureService()
         self._pending_load = None
         self._motion_epoch = 0
         self._queue = queue.PriorityQueue(maxsize=32)
@@ -210,6 +214,14 @@ class HardwareController:
 
     def clear_errors(self):
         return self._call('clear_errors')
+
+    def start_capture(self,plan):return self._call('capture',plan)
+    def capture_result(self):return self.capture_service.take()
+    def cancel_capture(self):self.capture_service.cancel()
+    def _do_capture(self,plan):
+        if self._state!='RUNNING' or any(b.get('state_code')!=CLOSED_LOOP or any(v!=0 for v in b['errors'].values()) for b in self._boards.values()):
+            raise ValueError('High-rate capture requires both motors in fault-free closed-loop operation.')
+        self.capture_service.start(self._devices,self._boards,self._profile,plan)
 
     def close(self):
         if not self._shutdown.is_set():
@@ -270,6 +282,8 @@ class HardwareController:
         if p['sensorless_min_rpm'] is not None:
             p['sensorless_min_rpm'] = _number(p['sensorless_min_rpm'], 'sensorless_min_rpm', 0, 100000)
         p['startup_timeout_s'] = _number(p['startup_timeout_s'],'startup_timeout_s',1,30)
+        if p['capture_bandwidth_hz'] is not None:p['capture_bandwidth_hz']=_number(p['capture_bandwidth_hz'],'capture_bandwidth_hz',.001,1e7)
+        p['capture_filtering']=str(p['capture_filtering'])[:1000]
         for path_key,scale_key in [('encoder_reference_path','encoder_reference_scale_rad'),('encoder_speed_path','encoder_speed_scale_rpm')]:
             path=p[path_key]
             if not isinstance(path,str) or (path and any(not part.isidentifier() or part.startswith('_') for part in path.split('.'))):
@@ -312,6 +326,10 @@ class HardwareController:
                 self._boards[role] = _empty_board(serial)
                 self._boards[role]['configuration'] = self._configuration(device)
                 self._boards[role]['runtime_api'] = self._runtime_api(device)
+                cfg=self._boards[role]['configuration']
+                enc=cfg.get('axis0.config.load_encoder'),cfg.get('axis0.config.commutation_encoder')
+                self._boards[role]['feedback_method']='sensorless' if enc==(SENSORLESS,SENSORLESS) else 'sensored'
+                self._boards[role]['capture']=inspect_capture(device,role,self._boards[role],self._profile,_read)
             self._state, self._error, self._stage = 'CONNECTED', '', 'monitoring'
             self._poll()
         except Exception as exc:
@@ -330,6 +348,7 @@ class HardwareController:
                 old = self._boards[role]
                 board = _empty_board(old['serial'])
                 board['configuration'], board['runtime_api'] = old['configuration'], old['runtime_api']
+                board['capture']=old.get('capture',{'available':False,'detail':'Not inspected'})
                 board['read_start_s'] = time.perf_counter()
                 state = _read(device, 'axis0.current_state')
                 if state is None:
@@ -446,11 +465,12 @@ class HardwareController:
             source='HARDWARE', sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
             acquisition=dict(kind='sequential host USB polling', requested_hz=self._profile['polling_hz'],
                 synchronized=False, timestamp='Host perf_counter seconds at end of each board read',
-                bandwidth_hz=None, onboard_capture='unverified / unavailable in this adapter'))
+                bandwidth_hz=None, onboard_capture='Finite buffer when compatible API and channels are present'),capture=self.capture_service.status())
         with self._lock:
             self._snapshot = result
 
     def _do_start(self, rpm, load_a, method, epoch):
+        if self.capture_service.thread and self.capture_service.thread.is_alive():raise ValueError('Wait for the previous capture download to finish.')
         if epoch!=self._motion_epoch:raise ValueError('Start cancelled by a newer Stop or Disconnect request.')
         if method not in ('sensored','sensorless'):
             raise ValueError('Feedback method must be sensored or sensorless.')
@@ -578,6 +598,7 @@ class HardwareController:
         return failures
 
     def _do_disconnect(self):
+        self.capture_service.cancel()
         if self._owned_motion:
             self._do_stop()
         failures = self._release_all()

@@ -40,10 +40,10 @@ Use the page dropdown to move between these views:
 | --- | --- |
 | Home | Operating sequence and explanation of the controls, signals and recording limits. |
 | Motors | Test motor in the left column and load motor in the right column; each shows DC voltage, DC current, rotor speed, rotor position and torque. |
-| Test matrix | Create or edit points, select one, inspect readiness and explicitly run that point. |
+| Test matrix | Select a tile and Run selected, or Run all selected tests; watch progress on the matrix. |
 | Python scripts | Read the actual source files that implement the application. Viewing source never executes it. |
 | Connections | Assign both serial numbers, save the validated profile, explicitly connect, inspect states/readiness and disconnect. |
-| Review and export | Review recorded runs, import external/onboard CSV data, select analysis windows and download complete run ZIP files. |
+| Review and export | Process ripple results, switch metrics, compare feedback modes at each load and export results CSV or raw run ZIPs. |
 
 Repeat comparisons and earlier analysis history remain available. Historical records retain their original acquisition-source tags; they are not relabelled as hardware experiments.
 
@@ -91,7 +91,7 @@ Unavailable or unsupported channels remain blank/null and are not replaced with 
 
 - **DC voltage:** reported board bus voltage.
 - **DC current:** the controller's reported/estimated DC-bus current, distinct from motor phase current and torque-producing Iq. Negative values can represent regeneration under the verified sign convention.
-- **Speed and position:** the configured ODrive velocity/position estimates in rpm and motor-shaft turns. In sensorless operation these are not automatically independent encoder measurements.
+- **Speed and position:** speed in rpm; displayed position in revolutions relative to the first reading after connection, Run selected or Zero positions. Raw axis position is preserved in recordings. In sensorless operation these are not automatically independent encoder measurements.
 - **Torque:** the configured torque constant multiplied by reported Iq, explicitly labelled as an estimate. It is not a torque-transducer measurement.
 
 The profile can describe a separately verified encoder path and scale for comparison measurements. Record its provenance and calibration. Do not label a generic sensorless velocity estimate as an independent encoder reference.
@@ -102,9 +102,32 @@ The live recorder saves new hardware samples to `recordings`, with actual host t
 
 The two boards and their fields are read sequentially. Their host timestamps do not make the measurements simultaneous. Windows scheduling, USB latency and the number of available fields all affect the achieved acquisition rate. The dashboard refresh rate and chart history length do not set the CSV sampling bandwidth.
 
-This version does **not** launch live onboard high-rate captures from the website. Import separately acquired onboard or external DAQ/oscilloscope CSV files through Review and export, declaring column mappings, units, device identity, calibration, bandwidth and synchronization. Raw imported files retain their own clock; no missing samples are interpolated. Continuous host polling is suitable for slower trends once benchmarked, not proof of adequate bandwidth for switching ripple or electrical-angle analysis.
+New steady-state plans require high-rate capture by default. Before motion, each board must expose the compatible oscilloscope API, a readable control-loop rate and all requested channels. Missing capability blocks the point before starting. Existing older plans retain their saved capture choice. The Connections page reports capability, rate and finite buffer size; enter the documented measurement bandwidth and filtering there before processing ripple. A motor current-control bandwidth is not automatically a measurement bandwidth.
 
-`capture_helpers.py` is an optional development helper for a finite onboard capture. It is deliberately separate from the active dashboard's synchronous board connections and has not been verified against these physical boards. It requires asynchronous device objects and an explicit verification declaration for each exact serial number, firmware, package version, property list, sample rate and buffer capacity before starting capture. It preserves control-cycle timestamps and derives seconds using that declared rate. Two software triggers do not synchronize the drives, and onboard buffer capture is not an unlimited stream. Do not open a second connection or capture on a drive already owned by this application.
+At settling, `capture_runtime.py` uses the official synchronous ODrive capture helper on the existing connections. Two download threads keep the controller thread available for watchdog feeding and Stop. Each drive saves phase A/B/C current, DC voltage/current, speed and axis position. A sensorless test additionally saves the verified independent encoder angle and estimated electrical angle (up to nine channels). Raw angles remain available; relative mechanical revolutions are derived using the saved pole-pair count. Signals unavailable on the installed firmware block capture rather than becoming generated values.
+
+Each board produces a **finite native-rate buffer**, not an unlimited high-rate stream. CSV files preserve the helper's trigger-relative control-cycle indices, device-reported sample rate, original axis positions and relative positions. Separate boards are **not synchronized**. The configured recording duration must cover capture and download. If duration expires while capture/download is pending, Stop/disconnect occurs, steady-state tolerances are lost, or the buffer is incomplete, the run is retained and marked invalid for ripple processing. Downloads time out after 25 seconds; an unfinished worker retains buffer ownership until it returns. Increase recording duration for a slow USB connection. Neither the reported control-loop rate nor a smooth graph establishes PWM switching-ripple bandwidth.
+
+The feature must still be checked on the actual installed firmware and USB setup. Firmware lacking the required endpoints cannot capture these channels from this application. The app never installs prerelease firmware or weakens motion prerequisites to obtain capture support. External DAQ/oscilloscope imports remain available with explicit units, bandwidth, calibration and timing declarations. `capture_helpers.py` remains an optional standalone development helper; do not open another connection to a drive already in use.
+
+## Running the matrix
+
+Open **Configure tests** to generate paired speed/load points or edit the included subset. Select a tile, then **Run selected**, or press **Run all selected tests** once to queue all included pending points. The Python process runs the queue independently of the browser. Each point settles, records, coasts to IDLE, and waits until both reported speeds are below 5 rpm before the next start. A fault, incomplete acquisition, unsupported feedback mode or missing capability pauses the queue with a reason. Stop cancels pending work. An application restart never resumes motion automatically.
+
+Feedback routing is never switched by the queue. Automatic sensorless startup remains blocked; a mixed queue pauses at such a point. Independently commissioned and already running sensorless sessions can be manually recorded using a selected sensorless plan, or imported from an external acquisition. A recorded tile means acquisition finished, not that an operator has accepted the result.
+
+## Processing current ripple
+
+**Review & export > Process all recorded results** reads original high-rate CSV samples. It uses a common duration (the shortest eligible buffer) so sensored and sensorless channel counts do not give unequal maximum-search windows. It fits a DC term plus sine/cosine at the electrical fundamental separately for each phase. The fundamental comes from captured speed and configured pole pairs, or a previously saved analysis of that same dataset with an explicit frequency for imported data. For imports without speed, first load the dataset, enter its frequency and Analyze selected window; then Process all recorded results. A frequency entered for one run is never applied to other speeds.
+
+The metric selector offers:
+
+- **Peak-to-peak:** `max over A/B/C of (max residual - min residual)` in amperes.
+- **Absolute peak:** `max over A/B/C of max(abs(residual))` in amperes.
+
+Each load graph has separate sensored and sensorless lines against rpm. A point is the maximum across valid independent repeats; the results table and CSV retain both metrics for each repeat. Retried attempts count once (latest valid attempt). Different acquisition sources, rates, bandwidths, filtering, device identities, calibration or analysis windows remain separate groups. Missing data remains gaps. Operator acceptance is displayed separately from numerical quality checks; process again after changes to runs/reviews.
+
+Unknown bandwidth/filtering, missing phase currents, timing gaps, clipping, partial/interrupted captures, speed outside tolerance or insufficient electrical cycles prevent ripple results. These are in-band residual metrics and include harmonics/noise; they are not isolated PWM ripple. Raw data, metadata and derived results are retained in each run ZIP; **Export processed results CSV** saves the comparison table with both metrics and run IDs.
 
 ## Files and checks
 
@@ -113,7 +136,10 @@ This version does **not** launch live onboard high-rate captures from the websit
 - `experiment.py`: plans, run storage, review history and ZIP export.
 - `signals.py` and `analysis.py`: channel definitions, quality checks and numerical analysis.
 - `import_data.py`: external CSV import and provenance.
-- `capture_helpers.py`: optional guarded onboard capture helper, not an active dashboard feature.
+- `capture_runtime.py`: onboard capture, original samples and per-board metadata.
+- `batch_runner.py`: persistent test queue and restart recovery.
+- `processing.py`: quality-gated ripple comparisons and processed CSV export.
+- `capture_helpers.py`: optional standalone development helper.
 - `recordings/connection-profile.json`: explicitly saved local profile.
 
 Run `python -m unittest discover -p 'test_*.py'` using the local environment for automated checks. Test fixtures exercise disconnected behavior, command validation and data handling without connecting physical boards. Passing them does not validate actual motor control, sensorless handover, USB timing, emergency stopping or measurement accuracy.
@@ -123,3 +149,5 @@ Official references for commissioning and API details:
 - [ODrive Python package](https://docs.odriverobotics.com/v/latest/guides/python-package.html)
 - [ODrive hardware configuration](https://docs.odriverobotics.com/v/latest/manual/hardware-config.html)
 - [ODrive sensorless operation](https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless)
+
+- [ODrive high-rate capture](https://docs.odriverobotics.com/v/latest/interfaces/odrivetool.html#high-rate-capture)
