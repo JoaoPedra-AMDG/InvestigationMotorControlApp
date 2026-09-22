@@ -5,7 +5,8 @@ https://docs.odriverobotics.com/v/latest/fibre_types/com_odriverobotics_ODrive.h
 https://docs.odriverobotics.com/v/latest/guides/python-package.html
 https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless
 
-Only the owner thread accesses boards. No synthetic runtime fallback. Injected
+Motion and polling use the owner thread. Finite capture downloads use the official
+synchronous, thread-safe helper off that thread. No synthetic runtime fallback. Injected
 connectors are reserved for unit tests and never exposed through the web API.
 """
 import copy
@@ -17,7 +18,10 @@ import queue
 import re
 import threading
 import time
+import uuid
+from settings_support import proposed_settings, same
 from concurrent.futures import Future, TimeoutError as FutureTimeout
+from capture_runtime import CaptureService,inspect_capture
 
 DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     max_speed_rpm=0., max_load_a=0., test_direction=1, load_direction=-1,
@@ -26,7 +30,8 @@ DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     axis_units_verified=False, startup_timeout_s=15., encoder_reference_path='',
     encoder_reference_scale_rad=None, encoder_reference_verified=False,
     encoder_speed_path='', encoder_speed_scale_rpm=None,
-    calibration=dict(verified=False,id='',pole_pairs=None,offset_rad=None,encoder_direction=1))
+    calibration=dict(verified=False,id='',pole_pairs=None,offset_rad=None,encoder_direction=1),
+    capture_bandwidth_hz=None,capture_filtering='')
 SIGNAL_PATHS = {
     'dc_voltage_v': ('vbus_voltage', 'V', 'measured'),
     'dc_current_a': ('ibus', 'A', 'estimated'),
@@ -152,6 +157,8 @@ class HardwareController:
         self._sample_id, self._acquired_at = 0, None
         self._package = installed()
         self._owned_motion = False
+        self.capture_service=CaptureService()
+        self._settings_preview=None;self._settings_result=None
         self._pending_load = None
         self._motion_epoch = 0
         self._queue = queue.PriorityQueue(maxsize=32)
@@ -210,6 +217,116 @@ class HardwareController:
 
     def clear_errors(self):
         return self._call('clear_errors')
+
+    def start_capture(self,plan):return self._call('capture',plan)
+    def capture_result(self):return self.capture_service.take()
+    def cancel_capture(self):self.capture_service.cancel()
+    def _do_capture(self,plan):
+        if self._state!='RUNNING' or any(b.get('state_code')!=CLOSED_LOOP or any(v!=0 for v in b['errors'].values()) for b in self._boards.values()):
+            raise ValueError('High-rate capture requires both motors in fault-free closed-loop operation.')
+        self.capture_service.start(self._devices,self._boards,self._profile,plan)
+
+    def refresh_settings(self):return self._call('refresh_settings')
+    def preview_settings(self,values):return self._call('preview_settings',dict(values))
+    def apply_settings(self,token,persist=False):return self._call('apply_settings',token,persist)
+    def update_limits(self,rpm,load):return self._call('update_limits',rpm,load)
+
+    def _settings_idle(self):
+        if self._owned_motion or len(self._devices)!=2:raise ValueError('Connect both boards and stop motion before changing board settings.')
+        if self.capture_service.thread and self.capture_service.thread.is_alive():raise ValueError('Wait for the capture download to finish.')
+        for role,device in self._devices.items():
+            if _serial(_read(device,'serial_number'))!=self._profile[role+'_serial']:raise ValueError('Board identity changed; reconnect.')
+            speed=_read(device,'axis0.vel_estimate')
+            if _read(device,'axis0.current_state')!=IDLE or _read(device,'axis0.is_armed') is not False or not isinstance(speed,(int,float)) or abs(speed*60)>1:
+                raise ValueError('Both boards must report IDLE, disarmed, and speed below 1 rpm before settings can be changed.')
+
+    def _do_refresh_settings(self):
+        for role,device in self._devices.items():self._boards[role]['configuration']=self._configuration(device)
+        if self._devices:self._poll()
+
+    def _do_update_limits(self,rpm,load):
+        rpm=_number(rpm,'Validated maximum speed (rpm)',.001,100000)
+        load=_number(load,'Validated maximum load (A)',.001,1000)
+        if self._devices:
+            self._settings_idle()
+            vel=_read(self._devices['test'],'axis0.controller.config.vel_limit')
+            current=_read(self._devices['load'],'axis0.config.motor.current_soft_max')
+            if not isinstance(vel,(int,float)) or rpm>vel*60 or not isinstance(current,(int,float)) or load>current:
+                raise ValueError('Local maxima must fit the existing test velocity limit and load current limit. This tool does not raise board current or voltage limits.')
+        self._profile.update(max_speed_rpm=rpm,max_load_a=load)
+        self._settings_preview=None
+
+    def _do_preview_settings(self,values):
+        self._settings_idle()
+        if not self._profile['roles_verified'] or not self._profile['axis_units_verified']:
+            raise ValueError('Verify the physical board roles and motor-shaft units in Connections first.')
+        self._do_refresh_settings()
+        firmware=next((c for c in self._readiness() if c['name']=='Firmware compatibility'),None)
+        if not firmware or firmware['state']!='pass':raise ValueError('Matching supported released firmware is required before changing board settings.')
+        proposed=proposed_settings(values,self._profile['polling_hz']);changes=[]
+        for role,paths in proposed.items():
+            device=self._devices[role]
+            if not callable(_read(device,'axis0.watchdog_feed')):raise ValueError(role+': watchdog feed API unavailable.')
+            for path,value in paths.items():
+                old=_read(device,path)
+                if not isinstance(old,(int,float,bool)):raise ValueError(role+': unsupported setting '+path)
+                changes.append({'role':role,'serial':self._profile[role+'_serial'],'path':path,'before':old,'after':value})
+        self._settings_preview={'token':uuid.uuid4().hex,'expires_at':time.monotonic()+120,'epoch':self._motion_epoch,'changes':changes}
+        self._settings_result=None
+        self._do_refresh_settings()
+
+    def _do_apply_settings(self,token,persist):
+        preview=self._settings_preview
+        self._settings_preview=None
+        if not preview or token!=preview['token'] or time.monotonic()>preview['expires_at']:
+            raise ValueError('Preview the settings again; the previous preview has expired or was already used.')
+        if not isinstance(persist,bool):raise ValueError('Save to board must be true or false.')
+        self._settings_idle()
+        if self._motion_epoch!=preview['epoch']:raise ValueError('Stop or disconnect cancelled the settings preview.')
+        if persist:
+            for role,device in self._devices.items():
+                if _read(device,'axis0.config.startup_closed_loop_control') is not False:
+                    raise ValueError(role+': saving requires startup_closed_loop_control=False to prevent automatic arming after reboot.')
+                for flag in ('startup_motor_calibration','startup_encoder_index_search','startup_encoder_offset_calibration','startup_homing'):
+                    if _read(device,'axis0.config.'+flag) is True:raise ValueError(role+': disable automatic startup procedures before saving.')
+        for change in preview['changes']:
+            if not same(_read(self._devices[change['role']],change['path']),change['before']):
+                raise ValueError('A board setting changed after preview. Refresh and preview again.')
+        if persist and not all(callable(_read(d,'save_configuration')) for d in self._devices.values()):
+            raise ValueError('Save configuration is unavailable on one board. Apply temporary settings instead.')
+        result={'state':'applying','changes':preview['changes'],'verified':[],'saved':[],'error':''};self._settings_result=result
+        try:
+            for change in preview['changes']:
+                self._settings_idle()
+                if self._motion_epoch!=preview['epoch']:raise ValueError('Stop cancelled the remaining settings updates.')
+                device=self._devices[change['role']]
+                if change['path']=='axis0.config.enable_watchdog':device.axis0.watchdog_feed()
+                obj=device;parts=change['path'].split('.')
+                for part in parts[:-1]:obj=getattr(obj,part)
+                setattr(obj,parts[-1],change['after'])
+                if not same(_read(device,change['path']),change['after']):raise ValueError('Read-back verification failed for '+change['path'])
+                result['verified'].append(change)
+            self._do_refresh_settings()
+            if persist:
+                # Saving may reboot/disconnect a board. Never infer successful
+                # persistence from a lost USB connection or automatically retry.
+                for role in ('test','load'):
+                    if self._motion_epoch!=preview['epoch']:raise ValueError('Stop cancelled the remaining saves.')
+                    device=self._devices[role]
+                    if _read(device,'axis0.current_state')!=IDLE or _read(device,'axis0.is_armed') is not False:raise ValueError('Board left IDLE before saving.')
+                    if device.save_configuration() is not True:raise ValueError(role+': board did not confirm configuration saved.')
+                    result['saved'].append(role)
+                result['state']='saved; reconnect to verify persistence'
+            else:result['state']='applied and read back; not saved to nonvolatile memory'
+        except Exception as exc:
+            result['state']='partial or failed';result['error']=str(exc)
+            self._error='Settings update incomplete: '+str(exc)
+            try:self._do_refresh_settings()
+            except Exception:pass
+            raise ValueError(self._error+' Inspect the verified changes before retrying.') from exc
+        finally:
+            if persist:
+                self._release_all();self._state='DISCONNECTED';self._stage='disconnected after configuration save'
 
     def close(self):
         if not self._shutdown.is_set():
@@ -270,6 +387,8 @@ class HardwareController:
         if p['sensorless_min_rpm'] is not None:
             p['sensorless_min_rpm'] = _number(p['sensorless_min_rpm'], 'sensorless_min_rpm', 0, 100000)
         p['startup_timeout_s'] = _number(p['startup_timeout_s'],'startup_timeout_s',1,30)
+        if p['capture_bandwidth_hz'] is not None:p['capture_bandwidth_hz']=_number(p['capture_bandwidth_hz'],'capture_bandwidth_hz',.001,1e7)
+        p['capture_filtering']=str(p['capture_filtering'])[:1000]
         for path_key,scale_key in [('encoder_reference_path','encoder_reference_scale_rad'),('encoder_speed_path','encoder_speed_scale_rpm')]:
             path=p[path_key]
             if not isinstance(path,str) or (path and any(not part.isidentifier() or part.startswith('_') for part in path.split('.'))):
@@ -312,6 +431,10 @@ class HardwareController:
                 self._boards[role] = _empty_board(serial)
                 self._boards[role]['configuration'] = self._configuration(device)
                 self._boards[role]['runtime_api'] = self._runtime_api(device)
+                cfg=self._boards[role]['configuration']
+                enc=cfg.get('axis0.config.load_encoder'),cfg.get('axis0.config.commutation_encoder')
+                self._boards[role]['feedback_method']='sensorless' if enc==(SENSORLESS,SENSORLESS) else 'sensored'
+                self._boards[role]['capture']=inspect_capture(device,role,self._boards[role],self._profile,_read)
             self._state, self._error, self._stage = 'CONNECTED', '', 'monitoring'
             self._poll()
         except Exception as exc:
@@ -330,6 +453,7 @@ class HardwareController:
                 old = self._boards[role]
                 board = _empty_board(old['serial'])
                 board['configuration'], board['runtime_api'] = old['configuration'], old['runtime_api']
+                board['capture']=old.get('capture',{'available':False,'detail':'Not inspected'})
                 board['read_start_s'] = time.perf_counter()
                 state = _read(device, 'axis0.current_state')
                 if state is None:
@@ -443,14 +567,16 @@ class HardwareController:
             boards=copy.deepcopy(self._boards), readiness=readiness,
             control_ready=all(c['state']=='pass' for c in readiness) and self._state in ('CONNECTED','RUNNING'),
             sample_id=self._sample_id, acquired_at_s=self._acquired_at, control_stage=self._stage,
+            settings_preview=copy.deepcopy(self._settings_preview),settings_result=copy.deepcopy(self._settings_result),
             source='HARDWARE', sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
             acquisition=dict(kind='sequential host USB polling', requested_hz=self._profile['polling_hz'],
                 synchronized=False, timestamp='Host perf_counter seconds at end of each board read',
-                bandwidth_hz=None, onboard_capture='unverified / unavailable in this adapter'))
+                bandwidth_hz=None, onboard_capture='Finite buffer when compatible API and channels are present'),capture=self.capture_service.status())
         with self._lock:
             self._snapshot = result
 
     def _do_start(self, rpm, load_a, method, epoch):
+        if self.capture_service.thread and self.capture_service.thread.is_alive():raise ValueError('Wait for the previous capture download to finish.')
         if epoch!=self._motion_epoch:raise ValueError('Start cancelled by a newer Stop or Disconnect request.')
         if method not in ('sensored','sensorless'):
             raise ValueError('Feedback method must be sensored or sensorless.')
@@ -578,6 +704,7 @@ class HardwareController:
         return failures
 
     def _do_disconnect(self):
+        self.capture_service.cancel()
         if self._owned_motion:
             self._do_stop()
         failures = self._release_all()

@@ -93,7 +93,7 @@ class HardwareOnlyHTTPTests(unittest.TestCase):
                     self.assertEqual(cm.exception.code,400)
                 with self.assertRaises(urllib.error.HTTPError) as cm:post({'action':'plan'},'http://untrusted.test')
                 self.assertEqual(cm.exception.code,403)
-                point=post({'action':'plan','rpm':1000,'load_a':2})
+                point=post({'action':'plan','capture_high_rate':False,'rpm':1000,'load_a':2})
                 post({'action':'select','id':point['id']})
                 for action in ({'action':'record','allow_unsettled':True},{'action':'run_test','id':point['id']},
                                {'action':'connect'},{'action':'fault'},{'action':'communication_loss'}):
@@ -117,7 +117,7 @@ class RecorderWorkflowTests(unittest.TestCase):
                 rig.action({'action':'connect'})
                 object.__setattr__(boards.test.axis0,'vel_estimate',1000/60)
                 object.__setattr__(boards.load.axis0.motor.foc,'Iq_measured',-2.)
-                p=rig.action({'action':'plan','duration_s':.2,'settle_s':0,'rpm':1000,'load_a':2})
+                p=rig.action({'action':'plan','capture_high_rate':False,'duration_s':.2,'settle_s':0,'rpm':1000,'load_a':2})
                 rig.action({'action':'run_test','id':p['id']})
                 wait_for(lambda:rig.active_run is not None)
                 wait_for(lambda:rig.store.run(rig.active_run)['status']!='recording')
@@ -132,7 +132,7 @@ class RecorderWorkflowTests(unittest.TestCase):
             finally:rig.close()
 
     def make_recording(self, rig, fixture):
-        p=rig.action({'action':'plan','test_type':'startup','duration_s':5,'rpm':1000,'load_a':2})
+        p=rig.action({'action':'plan','capture_high_rate':False,'test_type':'startup','duration_s':5,'rpm':1000,'load_a':2})
         rig.action({'action':'select','id':p['id']})
         fixture.publish(1);wait_for(lambda:rig.last_sample==1)
         rig.action({'action':'record'})
@@ -189,7 +189,7 @@ class RecorderWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture=SnapshotFixture();rig=Rig(directory,rate=100,controller=fixture)
             try:
-                p=rig.action({'action':'plan','duration_s':.1,'settle_s':0,'rpm':1000,'load_a':2})
+                p=rig.action({'action':'plan','capture_high_rate':False,'duration_s':.1,'settle_s':0,'rpm':1000,'load_a':2})
                 fixture.publish(1);wait_for(lambda:rig.last_sample==1)
                 rig.action({'action':'run_test','id':p['id']})
                 self.assertIn(('start',1000.,2.,'sensored'),fixture.commands)

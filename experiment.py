@@ -47,7 +47,7 @@ def finite(value, low, high, name):
     return value
 
 DEFAULT_PLAN={'method':'sensored','rpm':1000.,'load_a':2.,'test_type':'steady state','repeat':1,
-              'duration_s':5.,'settle_rpm':10.,'settle_load_a':.2,'settle_s':1.,'notes':'','selected':True}
+              'duration_s':5.,'settle_rpm':10.,'settle_load_a':.2,'settle_s':1.,'notes':'','selected':True,'capture_high_rate':True}
 TYPES=['steady state','speed change','load disturbance','startup','minimum-speed investigation']
 
 def validate_plan(data):
@@ -59,6 +59,7 @@ def validate_plan(data):
     p['repeat']=int(finite(p['repeat'],1,100,'repeat'))
     p['notes']=str(p['notes'])[:4000]
     p['selected']=bool(p['selected'])
+    if not isinstance(p['capture_high_rate'],bool):raise ValueError('High-rate capture choice must be true or false.')
     return p
 
 
@@ -116,8 +117,8 @@ class Store:
         for path in self.runs.glob('*/run.json'):
             try:
                 run=read_json(path)
-                if run['status']=='recording':
-                    run.update(status='invalid-acquisition',acquisition_status='interrupted',reason='Application interrupted before recorder finalization')
+                if run['status'] in ('recording','processing'):
+                    run.update(status='invalid-acquisition',acquisition_status='interrupted',reason='Application interrupted before recording/capture finalization')
                     atomic_json(path,run);self.event(run['id'],'recovered_interrupted_session',{})
                     for plan in self.plans:
                         if plan['id']==run.get('plan_id'):plan.update(status=run['status'],reason=run['reason'])
