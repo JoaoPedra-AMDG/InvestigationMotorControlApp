@@ -1,0 +1,31 @@
+{
+  "test_serial": "F00000000D01",
+  "load_serial": "F00000000D02",
+  "roles_verified": true,
+  "max_speed_rpm": 1000.0,
+  "max_load_a": 3.0,
+  "test_direction": 1,
+  "load_direction": -1,
+  "stop_policy": "coast",
+  "stop_policy_verified": true,
+  "polling_hz": 20.0,
+  "connection_timeout_s": 3.0,
+  "sensorless_startup_verified": false,
+  "sensorless_min_rpm": 0.0,
+  "axis_units_verified": true,
+  "startup_timeout_s": 15.0,
+  "encoder_reference_path": "",
+  "encoder_reference_scale_rad": null,
+  "encoder_reference_verified": false,
+  "encoder_speed_path": "",
+  "encoder_speed_scale_rpm": null,
+  "calibration": {
+    "verified": false,
+    "id": "",
+    "pole_pairs": null,
+    "offset_rad": null,
+    "encoder_direction": 1
+  },
+  "capture_bandwidth_hz": null,
+  "capture_filtering": ""
+}

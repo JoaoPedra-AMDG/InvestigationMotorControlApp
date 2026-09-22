@@ -18,6 +18,5 @@ recordings/
 Thumbs.db
 
 
-# MOCK-mode data and read-only property surveys (local evidence, not source)
-recordings-mock/
+# Read-only property surveys (local evidence, not source)
 surveys/

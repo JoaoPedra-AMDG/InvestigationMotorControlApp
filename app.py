@@ -1,4 +1,4 @@
-"""ODrive motor workbench: real boards (or an explicit, labelled --mock mode), explicit operator motion commands."""
+"""Two-board ODrive research workbench: real boards only, explicit operator motion commands."""
 import argparse
 import copy
 import json
@@ -26,22 +26,17 @@ SCRIPTS={'app.py':'Web server, run workflow and CSV acquisition','hardware.py':'
  'import_data.py':'Oscilloscope / DAQ CSV import and channel provenance','signals.py':'Canonical measurement units',
  'capture_runtime.py':'Finite onboard capture and original per-board timestamps','batch_runner.py':'Explicit batch queue and restart recovery',
  'processing.py':'Ripple processing and load/speed comparisons','settings_support.py':'Validated board settings for troubleshooting',
- 'mock_odrive.py':'MOCK boards for interface testing only (app.py --mock); never hardware data',
  'event_log.py':'Structured JSONL log of operator commands and state changes',
  'survey_odrive.py':'Stage 0: read-only ODrive property survey (separate command-line tool)'}
 
 
 class Rig:
-    def __init__(self,output=ROOT/'recordings',rate=20,controller=None,mock=False):
+    def __init__(self,output=ROOT/'recordings',rate=20,controller=None):
         self.output=Path(output);self.rate=rate;self.store=Store(self.output)
         self.lock=threading.RLock();self.shutdown=threading.Event()
         self.log=EventLog(self.output/'logs');self.last_logged_state=None
         self.profile_path=self.output/'connection-profile.json'
         profile=read_json(self.profile_path) if self.profile_path.exists() else dict(DEFAULT_PROFILE)
-        if mock and controller is None:
-            from mock_odrive import MockConnector,MOCK_PROFILE
-            if not self.profile_path.exists():profile=dict(profile,**MOCK_PROFILE)
-            controller=HardwareController(profile,connector=MockConnector())
         self.hardware=controller or HardwareController(profile)
         self.selected=None;self.recording=None;self.active_run=None;self.latest={};self.last_file='';self.error=''
         self.run_phase='idle';self.automated_point=False;self.command=0.;self.load=0.;self.mode=None
@@ -70,7 +65,7 @@ class Rig:
                     b['signals']['position_revolutions']=raw-self.position_zero[role]
                 else:b['signals']['position_revolutions']=None
             elapsed=time.perf_counter()-self.run_started_host if self.recording else None
-            return dict(self.latest,source=h.get('source','HARDWARE'),mock=h.get('mock',False),state=h['state'],hardware=h,error=self.error or h['error'],
+            return dict(self.latest,source='HARDWARE',state=h['state'],hardware=h,error=self.error or h['error'],
                 recording_elapsed_s=elapsed,
                 selected=self.selected,recording=bool(self.recording),active_run=self.active_run,run_phase=self.run_phase,
                 requested_hz=self.rate,actual_hz=actual,settled=self.settled(),file=self.last_file,
@@ -431,13 +426,11 @@ def make_handler(rig):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--rate',type=int,default=20,choices=range(1,101),metavar='1..100')
-    parser.add_argument('--mock',action='store_true',help='Use MOCK boards for interface testing. Never connects to hardware; data is labelled MOCK and kept in recordings-mock.')
     args=parser.parse_args()
     # Bind the server before opening storage to prevent a second process recovering an active run.
     server=ThreadingHTTPServer(('127.0.0.1',args.port),BaseHTTPRequestHandler)
-    rig=Rig(ROOT/'recordings-mock',rate=args.rate,mock=True) if args.mock else Rig(rate=args.rate)
-    server.RequestHandlerClass=make_handler(rig)
-    print(f"{'MOCK MODE (NOT HARDWARE)' if args.mock else 'ODRIVE HARDWARE'} WORKBENCH — http://127.0.0.1:{args.port}",flush=True)
+    rig=Rig(rate=args.rate);server.RequestHandlerClass=make_handler(rig)
+    print(f'ODRIVE HARDWARE WORKBENCH — http://127.0.0.1:{args.port}',flush=True)
     try:server.serve_forever()
     except KeyboardInterrupt:pass
     finally:server.server_close();rig.close()

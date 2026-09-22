@@ -1,9 +1,8 @@
-"""MOCK ODrive boards for exercising the interface without hardware.
+"""TEST FIXTURE ONLY: fake ODrive boards for the automated tests.
 
-Started only by `app.py --mock`. Everything produced here is labelled MOCK by
-HardwareController and stored under `recordings-mock`. The physics is a crude
-two-motor shaft model for testing screens and workflows; it is NOT a model of
-the BM1109 rig and its numbers must never be reported as measurements.
+The delivered application never imports this module (test_stage1 enforces it);
+there is no simulation mode. The physics is a crude shared-shaft model for
+exercising workflows in tests; it is not a model of the BM1109 rig.
 """
 import math
 import random
@@ -195,8 +194,7 @@ class MockBoard:
 
 
 class MockConnector:
-    """Connector interface used by HardwareController, backed by mock boards."""
-    is_mock = True
+    """Connector interface used by HardwareController in tests, backed by fixture boards."""
 
     def __init__(self):
         self.shaft = MockShaft()
@@ -204,7 +202,7 @@ class MockConnector:
 
     def discover(self, window_s):
         time.sleep(min(window_s, .2))
-        return {serial: 'MOCK ODrive (not hardware)' for serial in self.boards}
+        return {serial: 'TEST FIXTURE' for serial in self.boards}
 
     def connect(self, serial, timeout):
         if serial not in self.boards:

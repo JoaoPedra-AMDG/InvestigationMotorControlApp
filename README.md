@@ -1,6 +1,6 @@
 # ODrive two-motor workbench
 
-A local Python website for two commissioned ODrive Pro boards: one test motor in speed control and one sensored load motor in opposing torque control. The application uses real board data only, except in the explicitly started and always-labelled MOCK mode described below. When disconnected, values are unavailable and motor commands are blocked. Starting the application, opening a page, saving a plan or viewing a script does not connect or start a motor.
+A local Python website for two commissioned ODrive Pro boards: one test motor in speed control and one sensored load motor in opposing torque control. The application uses real board data only; there is no simulation mode. When disconnected, values are unavailable and motor commands are blocked. Starting the application, opening a page, saving a plan or viewing a script does not connect or start a motor.
 
 The hardware code is implemented but has not been validated on the physical rig. Keep the application disconnected while waiting for the USB isolators. You can prepare the connection profile, plan tests and inspect the Python source now.
 
@@ -131,20 +131,6 @@ Use the horizontal menu bar to move between these views:
 
 Repeat comparisons and earlier analysis history remain available. Historical records retain their original acquisition-source tags; they are not relabelled as hardware experiments.
 
-## MOCK mode (interface testing without hardware)
-
-```powershell
-.\.venv\Scripts\python.exe app.py --mock --port 8766
-```
-
-`--mock` replaces USB with two simulated boards (serials `F00000000D01` and `F00000000D02`) on a crude shared-shaft model. It exists only to test screens and workflows.
-
-- It cannot be enabled from the browser, and no real ODrive can be connected in the same process.
-- Every status, row and recording is labelled `source = MOCK`. A striped MOCK banner stays on screen.
-- Data is kept in `recordings-mock/`, separate from `recordings/`.
-- A real connection failure never falls back to mock data.
-- Mock numbers are not a model of the BM1109 rig and must never be reported as measurements.
-
 ## Stage 0: read-only property survey
 
 Before relying on any property name with real boards, survey each board once:
@@ -165,7 +151,7 @@ It writes nothing and cannot calibrate, arm, save or reboot.
 
 ## Event log
 
-Every command sent to `/api/command` (request, then accepted/rejected/failed) and every controller state change is appended to `recordings/logs/events-YYYYMMDD.jsonl` (or `recordings-mock/logs`). Bulky fields such as imported CSV text are summarised, not copied.
+Every command sent to `/api/command` (request, then accepted/rejected/failed) and every controller state change is appended to `recordings/logs/events-YYYYMMDD.jsonl`. Bulky fields such as imported CSV text are summarised, not copied.
 
 ## Commissioning before the first connection
 
@@ -260,7 +246,7 @@ Unknown bandwidth/filtering, missing phase currents, timing gaps, clipping, part
 - `batch_runner.py`: persistent test queue and restart recovery.
 - `processing.py`: quality-gated ripple comparisons and processed CSV export.
 - `capture_helpers.py`: optional standalone development helper.
-- `mock_odrive.py`: MOCK boards for `--mock` interface testing only.
+- `fixture_boards.py`: fake boards used only by the automated tests; never imported by the application.
 - `survey_odrive.py`: Stage 0 read-only property survey (command line).
 - `event_log.py`: JSONL command and state-change log.
 - `recordings/connection-profile.json`: explicitly saved local profile.

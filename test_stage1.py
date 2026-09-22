@@ -1,4 +1,4 @@
-"""Stage 1 tests: MOCK isolation, discovery, derived dashboard signals, event log, survey walker."""
+"""Stage 1 tests: no simulation mode, discovery, derived dashboard signals, event log, survey walker."""
 import json
 import tempfile
 import time
@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from hardware import HardwareController, DEFAULT_PROFILE, IDLE, CLOSED_LOOP
-from mock_odrive import MockConnector, MOCK_PROFILE, MOCK_SERIALS
+from fixture_boards import MockConnector, MOCK_PROFILE, MOCK_SERIALS
 from event_log import EventLog
 import survey_odrive
 
@@ -32,18 +32,12 @@ class MockModeTests(unittest.TestCase):
     def tearDown(self):
         self.hw.close()
 
-    def test_mock_is_labelled_and_never_hardware(self):
-        snap = self.hw.snapshot()
-        self.assertEqual(snap['source'], 'MOCK')
-        self.assertTrue(snap['mock'])
-
-    def test_real_or_fixture_connector_is_not_labelled_mock(self):
-        other = HardwareController(connector=object())
-        try:
-            self.assertEqual(other.snapshot()['source'], 'HARDWARE')
-            self.assertFalse(other.snapshot()['mock'])
-        finally:
-            other.close()
+    def test_application_has_no_simulation_mode(self):
+        root = Path(__file__).resolve().parent
+        for name in ('app.py', 'hardware.py', 'experiment.py', 'batch_runner.py', 'capture_runtime.py', 'workbench.js'):
+            text = (root/name).read_text(encoding='utf-8')
+            self.assertNotIn('fixture_boards', text, name)
+            self.assertNotIn('--mock', text, name)
 
     def test_discovery_lists_serials_without_connecting(self):
         snap = self.hw.discover(.5)
@@ -91,16 +85,15 @@ class MockModeTests(unittest.TestCase):
             self.hw.start(300, 0., 'sensorless')
 
 
-class RigMockTests(unittest.TestCase):
-    def test_rig_status_reports_mock_and_uses_mock_profile(self):
+class RigStatusTests(unittest.TestCase):
+    def test_rig_status_is_hardware_labelled_with_recording_clock(self):
         from app import Rig
         with tempfile.TemporaryDirectory() as directory:
-            rig = Rig(Path(directory)/'recordings-mock', rate=20, mock=True)
+            controller = HardwareController(mock_profile(), connector=MockConnector())
+            rig = Rig(Path(directory), rate=20, controller=controller)
             try:
                 status = rig.status()
-                self.assertEqual(status['source'], 'MOCK')
-                self.assertTrue(status['mock'])
-                self.assertEqual(status['hardware']['profile']['test_serial'], MOCK_SERIALS['test'])
+                self.assertEqual(status['source'], 'HARDWARE')
                 self.assertIsNone(status['recording_elapsed_s'])
             finally:
                 rig.close()

@@ -6,10 +6,9 @@ https://docs.odriverobotics.com/v/latest/guides/python-package.html
 https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless
 
 Motion and polling use the owner thread. Finite capture downloads use the official
-synchronous, thread-safe helper off that thread. No synthetic fallback: a real connection
-failure never switches to simulated data. The only non-hardware connector reachable from
-the web app is mock_odrive.MockConnector, chosen once at start-up with `app.py --mock`;
-every snapshot it produces is labelled source='MOCK'. Other injected connectors are test fixtures.
+synchronous, thread-safe helper off that thread. There is no simulation mode and no
+synthetic fallback. Injected connectors are test fixtures only and are never reachable
+from the web API.
 """
 import copy
 import importlib.metadata
@@ -146,7 +145,6 @@ empty_board = _empty_board
 
 
 class USBConnector:
-    is_mock = False
 
     def __init__(self):
         import odrive
@@ -216,8 +214,6 @@ class HardwareController:
     def __init__(self, profile=None, *, connector=None):
         self._profile = dict(DEFAULT_PROFILE)
         self._connector, self._injected = connector, connector is not None
-        # MOCK is decided once, from the connector type, and can never change.
-        self._source = 'MOCK' if getattr(connector, 'is_mock', False) else 'HARDWARE'
         self._discovered = None
         self._devices = {}
         self._boards = {r: _empty_board() for r in ('test', 'load')}
@@ -306,7 +302,7 @@ class HardwareController:
                 serial, note = str(raw), 'Serial number is not in the expected hexadecimal form.'
             role = next((r for r in ('test', 'load') if self._profile[r+'_serial'] == serial), None)
             boards.append(dict(serial=serial, device_type=kind, assigned_role=role, note=note))
-        self._discovered = dict(boards=boards, window_s=window_s, source=self._source,
+        self._discovered = dict(boards=boards, window_s=window_s,
             at_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             method='Passive USB discovery: serial numbers only; no connection opened, nothing read or written.')
 
@@ -685,7 +681,7 @@ class HardwareController:
             control_ready=all(c['state']=='pass' for c in readiness) and self._state in ('CONNECTED','RUNNING'),
             sample_id=self._sample_id, acquired_at_s=self._acquired_at, control_stage=self._stage,
             settings_preview=copy.deepcopy(self._settings_preview),settings_result=copy.deepcopy(self._settings_result),
-            source=self._source, mock=self._source=='MOCK', discovered=copy.deepcopy(self._discovered),
+            source='HARDWARE', discovered=copy.deepcopy(self._discovered),
             sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
             acquisition=dict(kind='sequential host USB polling', requested_hz=self._profile['polling_hz'],
                 synchronized=False, timestamp='Host perf_counter seconds at end of each board read',
