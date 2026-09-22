@@ -24,7 +24,7 @@ SCRIPTS={'app.py':'Web server, run workflow and CSV acquisition','hardware.py':'
  'capture_helpers.py':'Optional onboard capture integration helper (hardware capability verification required)',
  'import_data.py':'Oscilloscope / DAQ CSV import and channel provenance','signals.py':'Canonical measurement units',
  'capture_runtime.py':'Finite onboard capture and original per-board timestamps','batch_runner.py':'Explicit batch queue and restart recovery',
- 'processing.py':'Ripple processing and load/speed comparisons'}
+ 'processing.py':'Ripple processing and load/speed comparisons','settings_support.py':'Validated board settings for troubleshooting'}
 
 
 class Rig:
@@ -44,12 +44,13 @@ class Rig:
 
     def plan(self):return self.store.plan(self.selected) if self.selected else dict(DEFAULT_PLAN,id='manual')
     def settled(self):
-        p=self.plan();now=time.perf_counter();hold=p['settle_s'];window=[r for r in self.settle_history if now-r['host_perf_s']<=hold+.1]
-        profile=self.hardware.snapshot()['profile']
-        return bool(window and now-window[0]['host_perf_s']>=hold and now-window[-1]['host_perf_s']<.5 and
-            all(r.get('drive_rotor_rpm') is not None and r.get('load_iq_a') is not None and
-                abs(r['drive_rotor_rpm']-p['rpm']*profile['test_direction'])<=p['settle_rpm'] and
-                abs(r['load_iq_a']-p['load_a']*profile['load_direction'])<=p['settle_load_a'] and r['state']=='RUNNING' for r in window))
+        with self.lock:
+            p=self.plan();now=time.perf_counter();hold=p['settle_s'];window=[r for r in self.settle_history if now-r['host_perf_s']<=hold+.1]
+            profile=self.hardware.snapshot()['profile']
+            return bool(window and now-window[0]['host_perf_s']>=hold and now-window[-1]['host_perf_s']<.5 and
+                all(r.get('drive_rotor_rpm') is not None and r.get('load_iq_a') is not None and
+                    abs(r['drive_rotor_rpm']-p['rpm']*profile['test_direction'])<=p['settle_rpm'] and
+                    abs(r['load_iq_a']-p['load_a']*profile['load_direction'])<=p['settle_load_a'] and r['state']=='RUNNING' for r in window))
     def status(self):
         with self.lock:
             h=self.hardware.snapshot();actual=(len(self.sample_times)-1)/(self.sample_times[-1]-self.sample_times[0]) if len(self.sample_times)>1 and self.sample_times[-1]>self.sample_times[0] else None
@@ -194,6 +195,21 @@ class Rig:
             return self.status()
         if self.batch.reserved() and not from_batch and action in ('run_test','start','select','plan','skip','repeat','record','subset','matrix'):
             raise ValueError('The batch owns the test matrix. Cancel the batch before changing tests or using manual controls.')
+        if action in ('refresh_settings','preview_settings','apply_settings','update_limits'):
+            with self.lock:
+                if self.starting or self.recording or self.automated_point or self.capture_pending or self.batch.reserved():
+                    raise ValueError('Finish the active test or cancel the batch before changing settings.')
+                if action=='refresh_settings':return self.hardware.refresh_settings()
+                if action=='preview_settings':return self.hardware.preview_settings(data['values'])
+                if action=='update_limits':
+                    result=self.hardware.update_limits(data['max_speed_rpm'],data['max_load_a'])
+                    atomic_json(self.profile_path,result['profile']);return result
+                try:return self.hardware.apply_settings(data.get('token'),data.get('persist',False))
+                finally:
+                    result=self.hardware.snapshot().get('settings_result')
+                    if result:
+                        with (self.output/'settings-history.jsonl').open('a',encoding='utf-8') as f:
+                            f.write(json.dumps({'utc':datetime.now(timezone.utc).isoformat(),**result})+'\n')
         if action=='configure_connection':
             result=self.hardware.configure(data['profile']);atomic_json(self.profile_path,result['profile'])
             return result

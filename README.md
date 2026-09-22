@@ -4,23 +4,104 @@ A local Python website for two commissioned ODrive Pro boards: one test motor in
 
 The hardware code is implemented but has not been validated on the physical rig. Keep the application disconnected while waiting for the USB isolators. You can prepare the connection profile, plan tests and inspect the Python source now.
 
-## Start the local application
+## First-time setup on a lab computer
 
-The project has a local `.venv` environment. Its ODrive Python dependency is pinned to `odrive==0.6.11.post1`; this is a Python package version, not a firmware recommendation. Use Python 3.10 or later.
+Use these instructions once on each Windows or Linux computer that may operate the rig. Copy the complete `motor-dashboard` folder to the computer's local drive first. Do not run it from OneDrive, a network share or a USB drive, and do not copy a `.venv` folder from another computer.
 
-From PowerShell in this directory:
+Before connecting either board:
+
+1. Install 64-bit Python 3.10 or later.
+2. Confirm that the motors are mechanically safe, the independent emergency stop is available and the correct USB isolator is fitted to each ODrive.
+3. Close the ODrive GUI, `odrivetool` and any other program that could be using either board. Only one program can own an ODrive USB connection at a time.
+4. Complete the operating-system setup below.
+
+### Windows 10 or 11
+
+1. Open PowerShell in the copied `motor-dashboard` folder.
+2. Run:
+
+   ```powershell
+   .\start.ps1
+   ```
+
+   The launcher creates a new `.venv` for this computer, installs the required packages and starts the dashboard. If Python is installed but is not available from PowerShell, provide its full path:
+
+   ```powershell
+   .\start.ps1 -PythonPath 'C:\path\to\python.exe'
+   ```
+
+3. If Windows blocks local PowerShell scripts, use the manual commands under **Manual setup or troubleshooting** below.
+4. When the launcher reports that it is ready, open [http://127.0.0.1:8765](http://127.0.0.1:8765) in a browser.
+
+### Linux
+
+The ODrive Python package requires a supported 64-bit Linux distribution, `libusb` and ODrive USB permission rules. These commands are written for Ubuntu or Debian-based lab computers.
+
+1. Open a terminal in the copied `motor-dashboard` folder and install the required system packages:
+
+   ```bash
+   sudo apt update
+   sudo apt install python3 python3-venv python3-pip libusb-1.0-0 curl
+   ```
+
+2. Install the official ODrive USB permission rules once on that computer:
+
+   ```bash
+   sudo bash -c "curl https://cdn.odriverobotics.com/files/odrive-udev-rules.rules > /etc/udev/rules.d/91-odrive.rules && udevadm control --reload-rules && udevadm trigger"
+   ```
+
+3. Unplug and reconnect both ODrives after installing the rules.
+4. Create this computer's Python environment and install the application dependencies:
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/python -m pip install --upgrade pip
+   .venv/bin/python -m pip install -r requirements.txt
+   ```
+
+5. Start the dashboard without `sudo`:
+
+   ```bash
+   .venv/bin/python app.py
+   ```
+
+6. Open [http://127.0.0.1:8765](http://127.0.0.1:8765) in a browser.
+
+### First connection on either operating system
+
+Starting the application does not connect to or start a motor. In the dashboard:
+
+1. Open **Connections**.
+2. Enter the two ODrive serial numbers and assign the physical test and load roles.
+3. Enter the verified local speed, current and direction limits.
+4. Complete the commissioning confirmations only after checking the physical rig.
+5. Save the profile, click **Connect**, and resolve every readiness blocker before attempting motion.
+
+Repeat these checks when moving the rig to a different computer. Never treat the dashboard's software Stop button as an emergency stop.
+
+## Start the application after first-time setup
+
+The ODrive Python dependency is pinned to `odrive==0.6.11.post1`; this is a Python package version, not a firmware recommendation.
+
+On Windows, open PowerShell in the folder and run:
 
 ```powershell
 .\start.ps1
 ```
 
-The launcher creates `.venv` when needed and installs missing requirements. If Python is not on PATH, provide its actual path:
+On Linux, open a terminal in the folder and run:
 
-```powershell
-.\start.ps1 -PythonPath 'C:\path\to\python.exe'
+```bash
+.venv/bin/python app.py
 ```
 
-Or set up and start the application manually:
+Then open [http://127.0.0.1:8765](http://127.0.0.1:8765). The server binds only to that computer. Stop the application with Ctrl+C after ending the test. A second process cannot use the same port.
+
+The default recording target is 20 Hz. On Windows, `start.ps1 -Rate 50` requests a different rate. On either operating system, `app.py --rate 50` requests a rate between 1 and 100 Hz. The board polling rate is a separate connection-profile setting. Neither setting guarantees that rate; inspect actual timestamps and achieved rate. Increasing the recorder rate cannot create new board samples.
+
+## Manual setup or troubleshooting
+
+If the Windows launcher cannot create the environment automatically, run:
 
 ```powershell
 py -3 -m venv .venv
@@ -28,19 +109,18 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe app.py
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The server binds only to this computer. Stop the application with Ctrl+C after ending the test. A second process cannot use the same port. If PowerShell blocks local scripts, use the manual Python commands above.
-
-The default recording target is 20 Hz. `start.ps1 -Rate 50`, or `app.py --rate 50`, requests a different host-recorder rate between 1 and 100 Hz. The board polling rate is a separate connection-profile setting. Neither setting guarantees that rate; inspect actual timestamps and achieved rate. Increasing the recorder rate cannot create new board samples.
+If the `py` launcher is unavailable, replace `py -3` with the full path to `python.exe`. Delete only the local `.venv` directory and recreate it if it was copied from another computer or refers to a Python installation that no longer exists. Do not delete the `recordings` directory when doing this.
 
 ## Pages
 
-Use the page dropdown to move between these views:
+Use the horizontal menu bar to move between these views:
 
 | Page | Purpose |
 | --- | --- |
 | Home | Operating sequence and explanation of the controls, signals and recording limits. |
 | Motors | Test motor in the left column and load motor in the right column; each shows DC voltage, DC current, rotor speed, rotor position and torque. |
 | Test matrix | Select a tile and Run selected, or Run all selected tests; watch progress on the matrix. |
+| Troubleshooting | Diagnose local limits, watchdogs and controller modes; preview, apply and read back supported settings while idle. |
 | Python scripts | Read the actual source files that implement the application. Viewing source never executes it. |
 | Connections | Assign both serial numbers, save the validated profile, explicitly connect, inspect states/readiness and disconnect. |
 | Review and export | Process ripple results, switch metrics, compare feedback modes at each load and export results CSV or raw run ZIPs. |
@@ -49,7 +129,7 @@ Repeat comparisons and earlier analysis history remain available. Historical rec
 
 ## Commissioning before the first connection
 
-Commission both motors individually using the ODrive GUI, save their configurations, and release the GUI's USB connections before connecting this application. The application does not flash firmware, calibrate motors, change encoder routing or save new board configurations.
+Commission both motors individually using the ODrive GUI, save their configurations, and release the GUI's USB connections before connecting this application. The application does not flash firmware, calibrate motors, change encoder routing. The Troubleshooting page can explicitly update and optionally save the allowlisted watchdog, controller-mode, ramp and zero-setpoint settings.
 
 The current adapter checks these requirements before allowing motion:
 
@@ -151,3 +231,16 @@ Official references for commissioning and API details:
 - [ODrive sensorless operation](https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless)
 
 - [ODrive high-rate capture](https://docs.odriverobotics.com/v/latest/interfaces/odrivetool.html#high-rate-capture)
+
+## Fixing blocked setup checks
+
+Open **Troubleshooting** from the menu bar or the readiness panel. The five cards show the current local limits and each board's watchdog and control-mode checks.
+
+1. Enter validated local maximum speed and load current, then **Save local rig limits**. These only limit commands from this computer. Connected boards must be idle; values above their existing velocity/current limits are rejected.
+2. Connect the boards and verify their physical roles and axis units on Connections. Use **Read current board settings** to refresh the forms.
+3. Enter compatible watchdog timeouts and validated ramp rates. Test speed ramp is entered in rpm/s and converted to turns/s²; load torque ramp is entered in N·m/s.
+4. Click **Preview board changes**. Inspect both serial numbers and every current/proposed value. The tool sets test velocity control + velocity ramp, load torque control + torque ramp, enables both watchdogs, and zeros current and initial inputs. It does not run calibration, switch encoders or increase firmware current/voltage limits.
+5. Click **Apply reviewed board changes**. Each setting is read back. Both boards must stay IDLE, disarmed and below 1 rpm; no tests, captures or batches may be active. A changed/expired preview is rejected. Partial failures remain visible and are logged under `recordings/settings-history.jsonl`.
+6. To retain settings across power loss, tick the separate save option before Apply. This saves the entire current board configuration and may reboot the boards. Automatic startup must be disabled; connections are released and you must reconnect to verify persistence. A lost save response is reported as unconfirmed, never treated as success.
+
+These actions do not start either motor. Other readiness checks still apply. The watchdog timeout must be at least max(0.5 seconds, six polling periods) and at most 2 seconds. Lower polling rates may need adjustment in Connections. Clear errors is a separate action after resolving their cause.
