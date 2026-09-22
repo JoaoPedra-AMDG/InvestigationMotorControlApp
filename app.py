@@ -1,4 +1,4 @@
-"""ODrive motor workbench: real boards only, explicit operator motion commands."""
+"""ODrive motor workbench: real boards (or an explicit, labelled --mock mode), explicit operator motion commands."""
 import argparse
 import copy
 import json
@@ -17,6 +17,7 @@ from experiment import Store,Recorder,DEFAULT_PLAN,atomic_json,read_json
 from import_data import import_dataset
 from signals import UNITS
 from batch_runner import BatchRunner
+from event_log import EventLog
 
 ROOT=Path(__file__).resolve().parent
 SCRIPTS={'app.py':'Web server, run workflow and CSV acquisition','hardware.py':'ODrive connection, state checks and explicit motor commands',
@@ -24,15 +25,23 @@ SCRIPTS={'app.py':'Web server, run workflow and CSV acquisition','hardware.py':'
  'capture_helpers.py':'Optional onboard capture integration helper (hardware capability verification required)',
  'import_data.py':'Oscilloscope / DAQ CSV import and channel provenance','signals.py':'Canonical measurement units',
  'capture_runtime.py':'Finite onboard capture and original per-board timestamps','batch_runner.py':'Explicit batch queue and restart recovery',
- 'processing.py':'Ripple processing and load/speed comparisons','settings_support.py':'Validated board settings for troubleshooting'}
+ 'processing.py':'Ripple processing and load/speed comparisons','settings_support.py':'Validated board settings for troubleshooting',
+ 'mock_odrive.py':'MOCK boards for interface testing only (app.py --mock); never hardware data',
+ 'event_log.py':'Structured JSONL log of operator commands and state changes',
+ 'survey_odrive.py':'Stage 0: read-only ODrive property survey (separate command-line tool)'}
 
 
 class Rig:
-    def __init__(self,output=ROOT/'recordings',rate=20,controller=None):
+    def __init__(self,output=ROOT/'recordings',rate=20,controller=None,mock=False):
         self.output=Path(output);self.rate=rate;self.store=Store(self.output)
         self.lock=threading.RLock();self.shutdown=threading.Event()
+        self.log=EventLog(self.output/'logs');self.last_logged_state=None
         self.profile_path=self.output/'connection-profile.json'
         profile=read_json(self.profile_path) if self.profile_path.exists() else dict(DEFAULT_PROFILE)
+        if mock and controller is None:
+            from mock_odrive import MockConnector,MOCK_PROFILE
+            if not self.profile_path.exists():profile=dict(profile,**MOCK_PROFILE)
+            controller=HardwareController(profile,connector=MockConnector())
         self.hardware=controller or HardwareController(profile)
         self.selected=None;self.recording=None;self.active_run=None;self.latest={};self.last_file='';self.error=''
         self.run_phase='idle';self.automated_point=False;self.command=0.;self.load=0.;self.mode=None
@@ -60,7 +69,9 @@ class Rig:
                     self.position_zero.setdefault(role,raw)
                     b['signals']['position_revolutions']=raw-self.position_zero[role]
                 else:b['signals']['position_revolutions']=None
-            return dict(self.latest,source='HARDWARE',state=h['state'],hardware=h,error=self.error or h['error'],
+            elapsed=time.perf_counter()-self.run_started_host if self.recording else None
+            return dict(self.latest,source=h.get('source','HARDWARE'),mock=h.get('mock',False),state=h['state'],hardware=h,error=self.error or h['error'],
+                recording_elapsed_s=elapsed,
                 selected=self.selected,recording=bool(self.recording),active_run=self.active_run,run_phase=self.run_phase,
                 requested_hz=self.rate,actual_hz=actual,settled=self.settled(),file=self.last_file,
                 telemetry_age_s=time.perf_counter()-h['acquired_at_s'] if h['acquired_at_s'] is not None else None,
@@ -104,7 +115,7 @@ class Rig:
         load_kt=b['load']['configuration'].get('axis0.config.motor.torque_constant')
         load_torque=load.get('torque_command_nm')
         row['load_command_a']=load_torque/load_kt*h['profile']['load_direction'] if load_torque is not None and load_kt and load_kt>0 else None
-        now=h['acquired_at_s'];row.update(source='HARDWARE',feedback_mode=feedback,host_perf_s=now,monotonic_ns=int(now*1e9),
+        now=h['acquired_at_s'];row.update(source=h.get('source','HARDWARE'),feedback_mode=feedback,host_perf_s=now,monotonic_ns=int(now*1e9),
            test_read_start_s=b['test']['read_start_s'],test_read_end_s=b['test']['read_end_s'],load_read_start_s=b['load']['read_start_s'],load_read_end_s=b['load']['read_end_s'],
            test_sample_id=b['test']['sample_id'],load_sample_id=b['load']['sample_id'],time_s=now)
         return row
@@ -123,7 +134,7 @@ class Rig:
             self.capture_preflight(p,h)
             if not self.settled():raise ValueError('High-rate steady-state capture requires settled speed and load.')
         self.run_zero=time.perf_counter();self.run_started_host=self.run_zero;self.sequence=0
-        meta={'schema_version':3,'source':'HARDWARE','software_version':'3.0.0','python_version':sys.version,
+        meta={'schema_version':3,'source':h.get('source','HARDWARE'),'software_version':'3.0.0','python_version':sys.version,
           'plan':dict(p),'devices':h['boards'],'profile':h['profile'],'calibration':h['profile'].get('calibration',{}),
           'acquisition':{'source':'HOST_TELEMETRY','requested_hz':self.rate,'bandwidth_hz':None,'filtering':'Firmware report filtering; see saved board configuration. No interpolation.',
              'synchronization':{'simultaneous':False,'method':'Sequential USB reads; each board read interval retained','uncertainty_s':None}},
@@ -190,6 +201,10 @@ class Rig:
                 if action=='batch_resume':return self.batch.resume()
                 ids=data.get('ids',[p['id'] for p in self.store.plans if p['selected'] and p['status']=='pending'])
                 return self.batch.start(ids)
+        if action=='discover':
+            with self.lock:
+                if self.starting or self.recording or self.automated_point or self.batch.reserved():raise ValueError('Finish the active workflow before discovering boards.')
+            return self.hardware.discover(data.get('window_s',2.))
         if action=='zero_position':
             with self.lock:self.position_zero={}
             return self.status()
@@ -309,6 +324,11 @@ class Rig:
                 with self.lock:
                     self.collect_capture()
                     h=self.hardware.snapshot();now=time.perf_counter()
+                    state=(h['state'],h.get('control_stage'),h.get('error') or '')
+                    if state!=self.last_logged_state:
+                        self.last_logged_state=state
+                        self.log.write('state',source=h.get('source'),state=state[0],stage=state[1],error=state[2],
+                            boards={r:{'state':b.get('state'),'errors':b.get('errors')} for r,b in h['boards'].items()})
                     connected=all(b['connected'] for b in h['boards'].values())
                     fresh=h['acquired_at_s'] is not None and now-h['acquired_at_s']<1
                     if (self.recording or self.automated_point) and (not connected or not fresh or h['state']=='FAULT'):
@@ -399,19 +419,25 @@ def make_handler(rig):
                 if not 0<size<=10_000_000:raise ValueError('Request exceeds the 10 MB limit.')
                 data=json.loads(self.rfile.read(size))
                 if not isinstance(data,dict):raise ValueError('Expected an object.')
-                self.send(200,rig.action(data))
-            except (ValueError,KeyError,TypeError,StopIteration,RuntimeError,TimeoutError) as exc:self.send(400,{'error':str(exc) or 'Not found'})
-            except OSError as exc:self.send(500,{'error':'Storage/communication failure: '+str(exc)})
+                rig.log.command(data)
+                self.send(200,rig.action(data));rig.log.outcome(data,'accepted')
+            except (ValueError,KeyError,TypeError,StopIteration,RuntimeError,TimeoutError) as exc:
+                rig.log.outcome(locals().get('data'),'rejected',str(exc));self.send(400,{'error':str(exc) or 'Not found'})
+            except OSError as exc:
+                rig.log.outcome(locals().get('data'),'failed',str(exc));self.send(500,{'error':'Storage/communication failure: '+str(exc)})
     return Handler
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--port',type=int,default=8765)
-    parser.add_argument('--rate',type=int,default=20,choices=range(1,101),metavar='1..100');args=parser.parse_args()
+    parser.add_argument('--rate',type=int,default=20,choices=range(1,101),metavar='1..100')
+    parser.add_argument('--mock',action='store_true',help='Use MOCK boards for interface testing. Never connects to hardware; data is labelled MOCK and kept in recordings-mock.')
+    args=parser.parse_args()
     # Bind the server before opening storage to prevent a second process recovering an active run.
     server=ThreadingHTTPServer(('127.0.0.1',args.port),BaseHTTPRequestHandler)
-    rig=Rig(rate=args.rate);server.RequestHandlerClass=make_handler(rig)
-    print(f'ODRIVE HARDWARE WORKBENCH — http://127.0.0.1:{args.port}',flush=True)
+    rig=Rig(ROOT/'recordings-mock',rate=args.rate,mock=True) if args.mock else Rig(rate=args.rate)
+    server.RequestHandlerClass=make_handler(rig)
+    print(f"{'MOCK MODE (NOT HARDWARE)' if args.mock else 'ODRIVE HARDWARE'} WORKBENCH — http://127.0.0.1:{args.port}",flush=True)
     try:server.serve_forever()
     except KeyboardInterrupt:pass
     finally:server.server_close();rig.close()

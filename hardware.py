@@ -6,8 +6,10 @@ https://docs.odriverobotics.com/v/latest/guides/python-package.html
 https://docs.odriverobotics.com/v/latest/manual/hardware-config.html#sensorless
 
 Motion and polling use the owner thread. Finite capture downloads use the official
-synchronous, thread-safe helper off that thread. No synthetic runtime fallback. Injected
-connectors are reserved for unit tests and never exposed through the web API.
+synchronous, thread-safe helper off that thread. No synthetic fallback: a real connection
+failure never switches to simulated data. The only non-hardware connector reachable from
+the web app is mock_odrive.MockConnector, chosen once at start-up with `app.py --mock`;
+every snapshot it produces is labelled source='MOCK'. Other injected connectors are test fixtures.
 """
 import copy
 import importlib.metadata
@@ -49,8 +51,12 @@ SIGNAL_PATHS = {
     'controller_temp_c': ('axis0.motor.fet_thermistor.temperature', 'degC', 'measured'),
     'speed_command_rpm': ('axis0.controller.input_vel', 'rpm', 'commanded'),
     'torque_command_nm': ('axis0.controller.input_torque', 'Nm', 'commanded using configured Kt'),
+    'speed_setpoint_rpm': ('axis0.controller.vel_setpoint', 'rpm', 'ramped controller setpoint'),
+    'torque_setpoint_nm': ('axis0.controller.torque_setpoint', 'Nm', 'ramped controller setpoint'),
 }
-EXTRA_SIGNALS = ('torque_nm', 'encoder_mech_rad', 'encoder_speed_rpm', 'sensorless_speed_rpm')
+RPM_SIGNALS = ('speed_rpm', 'speed_command_rpm', 'speed_setpoint_rpm')
+EXTRA_SIGNALS = ('torque_nm', 'encoder_mech_rad', 'encoder_speed_rpm', 'sensorless_speed_rpm',
+    'electrical_power_w', 'speed_error_rpm', 'iq_error_a')
 CONFIG_PATHS = [
     'axis0.config.load_encoder', 'axis0.config.commutation_encoder',
     'axis0.config.motor.phase_resistance_valid', 'axis0.config.motor.phase_inductance_valid',
@@ -74,6 +80,15 @@ CONFIG_PATHS = [
     'axis0.config.sensorless_ramp.vel', 'axis0.config.sensorless_ramp.accel',
     'axis0.config.sensorless_ramp.current', 'axis0.config.sensorless_ramp.ramp_time',
     'axis0.motor.motor_thermistor.config.enabled',
+    # Read-only display fields for the Configuration page. A path the firmware
+    # does not expose reads as unavailable; nothing here is written.
+    'axis0.config.motor.motor_type', 'axis0.config.motor.calibration_current',
+    'axis0.config.motor.resistance_calib_max_voltage',
+    'axis0.controller.config.enable_vel_limit', 'axis0.controller.config.enable_torque_mode_vel_limit',
+    'axis0.config.torque_soft_min', 'axis0.config.torque_soft_max',
+    'axis0.config.startup_closed_loop_control', 'axis0.config.startup_motor_calibration',
+    'axis0.config.startup_encoder_offset_calibration', 'config.brake_resistor0.enable',
+    'inc_encoder0.config.enabled', 'inc_encoder0.config.cpr',
 ]
 IDLE, CLOSED_LOOP, SENSORLESS = 1, 8, 4  # Documented AxisState and EncoderId.
 SENSORED_ENCODERS = {1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
@@ -131,9 +146,37 @@ empty_board = _empty_board
 
 
 class USBConnector:
+    is_mock = False
+
     def __init__(self):
         import odrive
         self.odrive = odrive
+
+    def discover(self, window_s):
+        """List ODrives visible on USB for window_s without opening a connection."""
+        from odrive.device_manager import get_device_manager, FilterSpec, DeviceManagerDelegate
+        from odrive._internal_utils import run_on_loop
+        manager, found, lock = get_device_manager(), {}, threading.Lock()
+
+        class Collector(DeviceManagerDelegate):
+            def on_found_device(self, dev):
+                kind = getattr(dev.info.device_type, 'name', dev.info.device_type)
+                with lock:
+                    found[str(dev.info.serial_number)] = str(kind)
+
+        async def subscribe():
+            return manager.subscribe(FilterSpec(interfaces=['usb']), Collector())
+
+        async def unsubscribe(subscription):
+            manager.unsubscribe(subscription)
+
+        subscription = run_on_loop(subscribe(), manager.loop)
+        try:
+            time.sleep(window_s)
+        finally:
+            run_on_loop(unsubscribe(subscription), manager.loop)
+        with lock:
+            return dict(found)
 
     def connect(self, serial, timeout):
         if not hasattr(self.odrive, 'find_sync'):
@@ -141,16 +184,41 @@ class USBConnector:
         return self.odrive.find_sync(serial_number=serial, timeout=timeout, interfaces=['usb'])
 
     def release(self, device):
-        release = getattr(self.odrive, 'release_connection', None)
-        if release is None:
-            raise RuntimeError('ODrive package cannot explicitly release USB; close this app before opening the GUI.')
+        release_sync_device(device)
+
+
+def release_sync_device(device):
+    """Release a find_sync() connection so another program can claim the board.
+
+    odrive 0.6.11 has no top-level release_connection(); the documented call is
+    DeviceManager.release_connection(), which must run on the manager's event loop
+    and takes the RuntimeDevice wrapped by the SyncObject (its _dev attribute).
+    """
+    import odrive
+    release = getattr(odrive, 'release_connection', None)
+    if release is not None:
         release(device)
+        return
+    from odrive.device_manager import get_device_manager
+    from odrive._internal_utils import run_on_loop
+    runtime = getattr(device, '_dev', None)
+    if runtime is None:
+        raise RuntimeError('ODrive package cannot explicitly release USB; close this app before opening the GUI.')
+    manager = get_device_manager()
+
+    async def release_on_loop():
+        manager.release_connection(runtime)
+
+    run_on_loop(release_on_loop(), manager.loop)
 
 
 class HardwareController:
     def __init__(self, profile=None, *, connector=None):
         self._profile = dict(DEFAULT_PROFILE)
         self._connector, self._injected = connector, connector is not None
+        # MOCK is decided once, from the connector type, and can never change.
+        self._source = 'MOCK' if getattr(connector, 'is_mock', False) else 'HARDWARE'
+        self._discovered = None
         self._devices = {}
         self._boards = {r: _empty_board() for r in ('test', 'load')}
         self._state, self._error, self._stage = 'DISCONNECTED', '', 'disconnected'
@@ -217,6 +285,30 @@ class HardwareController:
 
     def clear_errors(self):
         return self._call('clear_errors')
+
+    def discover(self, window_s=2.):
+        return self._call('discover', window_s)
+
+    def _do_discover(self, window_s):
+        if self._devices:
+            raise ValueError('Disconnect before discovering; connected boards are already identified.')
+        window_s = _number(window_s, 'Discovery window (s)', .5, 10)
+        self._package = installed()
+        if not self._injected and not self._package['package_installed']:
+            raise ValueError('ODrive Python package is not installed in this application environment.')
+        if self._connector is None:
+            self._connector = USBConnector()
+        boards = []
+        for raw, kind in sorted(self._connector.discover(window_s).items()):
+            try:
+                serial, note = _serial(raw), ''
+            except ValueError:
+                serial, note = str(raw), 'Serial number is not in the expected hexadecimal form.'
+            role = next((r for r in ('test', 'load') if self._profile[r+'_serial'] == serial), None)
+            boards.append(dict(serial=serial, device_type=kind, assigned_role=role, note=note))
+        self._discovered = dict(boards=boards, window_s=window_s, source=self._source,
+            at_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            method='Passive USB discovery: serial numbers only; no connection opened, nothing read or written.')
 
     def start_capture(self,plan):return self._call('capture',plan)
     def capture_result(self):return self.capture_service.take()
@@ -408,7 +500,9 @@ class HardwareController:
         self._boards = {r: _empty_board(p[r+'_serial']) for r in ('test', 'load')}
 
     def _configuration(self, device):
-        return {path: _read(device, path) for path in CONFIG_PATHS}
+        values = {path: _read(device, path) for path in CONFIG_PATHS}
+        # Only plain values are published; an object or function at a path is unavailable.
+        return {k: v if isinstance(v, (bool, int, float, str)) or v is None else None for k, v in values.items()}
 
     def _do_connect(self):
         if self._devices:
@@ -470,7 +564,9 @@ class HardwareController:
                 board['feedback_method'] = 'sensorless' if enc == (SENSORLESS, SENSORLESS) else ('sensored' if all(e in SENSORED_ENCODERS for e in enc) else 'mixed / unverified')
                 for name, (path, unit, kind) in SIGNAL_PATHS.items():
                     value = _read(device, path)
-                    if value is not None and name in ('speed_rpm', 'speed_command_rpm'):
+                    if not isinstance(value, (int, float)) or isinstance(value, bool):
+                        value = None
+                    if value is not None and name in RPM_SIGNALS:
                         value *= 60
                     board['signals'][name] = value
                     board['provenance'][name] = dict(path=path, unit=unit, kind=kind, available=value is not None,
@@ -483,6 +579,7 @@ class HardwareController:
                     board['signals']['torque_nm'] = iq*kt
                 board['provenance']['torque_nm'] = dict(path='configured torque_constant * Iq_measured', unit='Nm',
                     kind='estimate from configured Kt; not independently measured shaft torque', available=board['signals']['torque_nm'] is not None)
+                self._derive(board)
                 pp, phase_vel = c.get('axis0.config.motor.pole_pairs'), _read(device, 'axis0.motor.sensorless_estimator.phase_vel')
                 if phase_vel is not None and pp is not None and pp > 0:
                     board['signals']['sensorless_speed_rpm'] = phase_vel*60/(2*math.pi*pp)
@@ -527,6 +624,26 @@ class HardwareController:
         if self._state == 'STOPPING' and all(b.get('state_code') == IDLE for b in next_boards.values()):
             self._state = 'CONNECTED'
 
+    @staticmethod
+    def _derive(board):
+        """Dashboard quantities calculated from values read in the same board poll."""
+        s, prov = board['signals'], board['provenance']
+        volts, amps = s['dc_voltage_v'], s['dc_current_a']
+        s['electrical_power_w'] = volts*amps if volts is not None and amps is not None else None
+        prov['electrical_power_w'] = dict(path='vbus_voltage * ibus', unit='W',
+            kind='DC electrical input power from reported bus voltage and estimated bus current',
+            available=s['electrical_power_w'] is not None)
+        reference = s['speed_setpoint_rpm'] if s['speed_setpoint_rpm'] is not None else s['speed_command_rpm']
+        source = 'vel_setpoint' if s['speed_setpoint_rpm'] is not None else 'input_vel'
+        velocity_mode = board['configuration'].get('axis0.controller.config.control_mode') == 2
+        s['speed_error_rpm'] = reference-s['speed_rpm'] if velocity_mode and reference is not None and s['speed_rpm'] is not None else None
+        prov['speed_error_rpm'] = dict(path=source+' - vel_estimate', unit='rpm',
+            kind='reference minus selected feedback estimate; meaningful only in closed-loop velocity control',
+            available=s['speed_error_rpm'] is not None)
+        s['iq_error_a'] = s['iq_command_a']-s['iq_a'] if s['iq_command_a'] is not None and s['iq_a'] is not None else None
+        prov['iq_error_a'] = dict(path='Iq_setpoint - Iq_measured', unit='A',
+            kind='current-loop tracking error from firmware-filtered values', available=s['iq_error_a'] is not None)
+
     def _readiness(self):
         p, checks = self._profile, []
         def check(name, okay, detail):
@@ -568,7 +685,8 @@ class HardwareController:
             control_ready=all(c['state']=='pass' for c in readiness) and self._state in ('CONNECTED','RUNNING'),
             sample_id=self._sample_id, acquired_at_s=self._acquired_at, control_stage=self._stage,
             settings_preview=copy.deepcopy(self._settings_preview),settings_result=copy.deepcopy(self._settings_result),
-            source='HARDWARE', sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
+            source=self._source, mock=self._source=='MOCK', discovered=copy.deepcopy(self._discovered),
+            sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
             acquisition=dict(kind='sequential host USB polling', requested_hz=self._profile['polling_hz'],
                 synchronized=False, timestamp='Host perf_counter seconds at end of each board read',
                 bandwidth_hz=None, onboard_capture='Finite buffer when compatible API and channels are present'),capture=self.capture_service.status())

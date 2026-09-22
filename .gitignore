@@ -17,3 +17,7 @@ recordings/
 .DS_Store
 Thumbs.db
 
+
+# MOCK-mode data and read-only property surveys (local evidence, not source)
+recordings-mock/
+surveys/

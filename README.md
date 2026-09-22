@@ -1,6 +1,6 @@
 # ODrive two-motor workbench
 
-A local Python website for two commissioned ODrive Pro boards: one test motor in speed control and one sensored load motor in opposing torque control. The application uses real board data only. When disconnected, values are unavailable and motor commands are blocked. Starting the application, opening a page, saving a plan or viewing a script does not connect or start a motor.
+A local Python website for two commissioned ODrive Pro boards: one test motor in speed control and one sensored load motor in opposing torque control. The application uses real board data only, except in the explicitly started and always-labelled MOCK mode described below. When disconnected, values are unavailable and motor commands are blocked. Starting the application, opening a page, saving a plan or viewing a script does not connect or start a motor.
 
 The hardware code is implemented but has not been validated on the physical rig. Keep the application disconnected while waiting for the USB isolators. You can prepare the connection profile, plan tests and inspect the Python source now.
 
@@ -118,6 +118,8 @@ Use the horizontal menu bar to move between these views:
 | Page | Purpose |
 | --- | --- |
 | Home | Operating sequence and explanation of the controls, signals and recording limits. |
+| Dashboard | Both motors side by side: axis state, control/input mode, speed reference and measured, speed error (velocity control only), Iq reference/measured/tracking error, Id, Kt × Iq torque estimate, selected-feedback and sensorless estimates, DC bus voltage/current/power, temperatures, errors, recording state and elapsed time, plus 30 s live plots. Read-only in this version. |
+| Configuration | Discover ODrives on USB by serial number without connecting, assign drive/load roles, and view each board's configuration read from the board, grouped as motor, encoder, control, DC bus, start-up and sensorless ramp. Read-only in this version. |
 | Motors | Test motor in the left column and load motor in the right column; each shows DC voltage, DC current, rotor speed, rotor position and torque. |
 | Test matrix | Select a tile and Run selected, or Run all selected tests; watch progress on the matrix. |
 | Troubleshooting | Diagnose local limits, watchdogs and controller modes; preview, apply and read back supported settings while idle. |
@@ -125,7 +127,45 @@ Use the horizontal menu bar to move between these views:
 | Connections | Assign both serial numbers, save the validated profile, explicitly connect, inspect states/readiness and disconnect. |
 | Review and export | Process ripple results, switch metrics, compare feedback modes at each load and export results CSV or raw run ZIPs. |
 
+**Stop both · coast** in the menu bar is on every page. It requests IDLE on both boards, so both motors coast. It is a software command and is not the emergency stop.
+
 Repeat comparisons and earlier analysis history remain available. Historical records retain their original acquisition-source tags; they are not relabelled as hardware experiments.
+
+## MOCK mode (interface testing without hardware)
+
+```powershell
+.\.venv\Scripts\python.exe app.py --mock --port 8766
+```
+
+`--mock` replaces USB with two simulated boards (serials `F00000000D01` and `F00000000D02`) on a crude shared-shaft model. It exists only to test screens and workflows.
+
+- It cannot be enabled from the browser, and no real ODrive can be connected in the same process.
+- Every status, row and recording is labelled `source = MOCK`. A striped MOCK banner stays on screen.
+- Data is kept in `recordings-mock/`, separate from `recordings/`.
+- A real connection failure never falls back to mock data.
+- Mock numbers are not a model of the BM1109 rig and must never be reported as measurements.
+
+## Stage 0: read-only property survey
+
+Before relying on any property name with real boards, survey each board once:
+
+```powershell
+.\.venv\Scripts\python.exe survey_odrive.py --serial <SERIAL>
+```
+
+Close the ODrive GUI, `odrivetool` and this workbench first. The survey:
+
+- connects to that one serial number;
+- reads every property value, type and writability;
+- records function signatures **without calling them**;
+- lists which properties used by the workbench are missing on that firmware;
+- saves `surveys/<serial>_<time>.json` and releases USB.
+
+It writes nothing and cannot calibrate, arm, save or reboot.
+
+## Event log
+
+Every command sent to `/api/command` (request, then accepted/rejected/failed) and every controller state change is appended to `recordings/logs/events-YYYYMMDD.jsonl` (or `recordings-mock/logs`). Bulky fields such as imported CSV text are summarised, not copied.
 
 ## Commissioning before the first connection
 
@@ -220,6 +260,9 @@ Unknown bandwidth/filtering, missing phase currents, timing gaps, clipping, part
 - `batch_runner.py`: persistent test queue and restart recovery.
 - `processing.py`: quality-gated ripple comparisons and processed CSV export.
 - `capture_helpers.py`: optional standalone development helper.
+- `mock_odrive.py`: MOCK boards for `--mock` interface testing only.
+- `survey_odrive.py`: Stage 0 read-only property survey (command line).
+- `event_log.py`: JSONL command and state-change log.
 - `recordings/connection-profile.json`: explicitly saved local profile.
 
 Run `python -m unittest discover -p 'test_*.py'` using the local environment for automated checks. Test fixtures exercise disconnected behavior, command validation and data handling without connecting physical boards. Passing them does not validate actual motor control, sensorless handover, USB timing, emergency stopping or measurement accuracy.
