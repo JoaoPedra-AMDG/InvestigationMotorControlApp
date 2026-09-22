@@ -9,7 +9,8 @@ import random
 import threading
 import time
 
-IDLE, CLOSED_LOOP = 1, 8
+IDLE, CLOSED_LOOP, LOCKIN_SPIN = 1, 8, 9
+CALIBRATION_STATES = (3, 4, 7)
 MOCK_WATCHDOG_ERROR = 1  # Mock-only code; not an ODrive firmware error value.
 MOCK_SERIALS = {'test': 'F00000000D01', 'load': 'F00000000D02'}
 MOCK_PROFILE = dict(test_serial=MOCK_SERIALS['test'], load_serial=MOCK_SERIALS['load'],
@@ -57,6 +58,7 @@ class MockAxis:
         object.__setattr__(self, '_last_feed', time.perf_counter())
         object.__setattr__(self, '_torque', 0.)
         object.__setattr__(self, '_integral', 0.)
+        object.__setattr__(self, '_until', 0.)
         velocity = role == 'test'
         motor_cfg = Node(motor_type=0, pole_pairs=3, torque_constant=.1061, phase_resistance=.05,
             phase_inductance=100e-6, phase_resistance_valid=True, phase_inductance_valid=True,
@@ -93,6 +95,15 @@ class MockAxis:
     @property
     def current_state(self):
         self._board._shaft.step()
+        now = time.perf_counter()
+        if self._state in CALIBRATION_STATES and now >= self._until:
+            object.__setattr__(self, '_state', IDLE)
+            self.procedure_result = 0
+        if self._state == LOCKIN_SPIN and now >= self._until:
+            # Documented sensorless behaviour: input_vel is set to the ramp speed, then closed loop.
+            ramp = self.config.sensorless_ramp
+            self.controller.input_vel = ramp.vel/(2*math.pi*self.config.motor.pole_pairs)
+            object.__setattr__(self, '_state', CLOSED_LOOP)
         return self._state
 
     @property
@@ -112,7 +123,15 @@ class MockAxis:
             self.controller.input_vel = self.config.init_vel
             self.controller.input_torque = self.config.init_torque
             object.__setattr__(self, '_last_feed', time.perf_counter())
-            object.__setattr__(self, '_state', CLOSED_LOOP)
+            if self.config.load_encoder == 4:
+                object.__setattr__(self, '_until', time.perf_counter()+self.config.sensorless_ramp.ramp_time)
+                object.__setattr__(self, '_state', LOCKIN_SPIN)
+            else:
+                object.__setattr__(self, '_state', CLOSED_LOOP)
+        elif value in CALIBRATION_STATES and self.active_errors == 0:
+            self.procedure_result = 1
+            object.__setattr__(self, '_until', time.perf_counter()+self._board._calibration_s)
+            object.__setattr__(self, '_state', value)
         else:
             self.procedure_result = 13  # INVALID_STATE: mock boards do not calibrate.
 
@@ -121,6 +140,11 @@ class MockAxis:
 
     def torque_step(self, dt, speed):
         c = self.controller
+        if self._state == LOCKIN_SPIN:
+            # Open-loop ramp stand-in: accelerate the shaft toward the ramp speed.
+            target = self.config.sensorless_ramp.vel/(2*math.pi*self.config.motor.pole_pairs)
+            object.__setattr__(self, '_torque', .05*(target-speed))
+            return self._torque
         if self._state != CLOSED_LOOP:
             c.vel_setpoint, c.torque_setpoint = speed, 0.
             object.__setattr__(self, '_torque', 0.)
@@ -161,6 +185,8 @@ class MockBoard:
         self.config = Node(dc_bus_overvoltage_trip_level=30., dc_bus_undervoltage_trip_level=20.,
             dc_max_positive_current=20., dc_max_negative_current=-10.,
             brake_resistor0=Node(enable=False))
+        self.reboot_required = False
+        self._calibration_s = .3
         self.axis0 = MockAxis(self, role)
 
     def update_readings(self, speed, position, elapsed):

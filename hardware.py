@@ -23,6 +23,8 @@ import uuid
 from settings_support import proposed_settings, same
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from capture_runtime import CaptureService,inspect_capture
+from hardware_config import ConfigMixin
+from odrive_reference import REGISTRY, decode_errors, decode_procedure
 
 DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     max_speed_rpm=0., max_load_a=0., test_direction=1, load_direction=-1,
@@ -32,7 +34,12 @@ DEFAULT_PROFILE = dict(test_serial='', load_serial='', roles_verified=False,
     encoder_reference_scale_rad=None, encoder_reference_verified=False,
     encoder_speed_path='', encoder_speed_scale_rpm=None,
     calibration=dict(verified=False,id='',pole_pairs=None,offset_rad=None,encoder_direction=1),
-    capture_bandwidth_hz=None,capture_filtering='')
+    capture_bandwidth_hz=None,capture_filtering='',
+    # Chain coupling: test-motor rpm = coupling_ratio * coupling_sign * load-motor rpm,
+    # each in its own board coordinates. Needed to confirm sensorless handover and to
+    # detect chain slip/breakage. None disables both (sensorless start then blocked).
+    coupling_ratio=None,coupling_sign=1,coupling_verified=False,
+    handover_tolerance_rpm=30.,handover_hold_s=1.)
 SIGNAL_PATHS = {
     'dc_voltage_v': ('vbus_voltage', 'V', 'measured'),
     'dc_current_a': ('ibus', 'A', 'estimated'),
@@ -52,6 +59,9 @@ SIGNAL_PATHS = {
     'torque_command_nm': ('axis0.controller.input_torque', 'Nm', 'commanded using configured Kt'),
     'speed_setpoint_rpm': ('axis0.controller.vel_setpoint', 'rpm', 'ramped controller setpoint'),
     'torque_setpoint_nm': ('axis0.controller.torque_setpoint', 'Nm', 'ramped controller setpoint'),
+    'torque_estimate_nm': ('axis0.motor.torque_estimate', 'Nm', 'firmware torque estimate (model-based, not a shaft measurement)'),
+    'motor_electrical_power_w': ('axis0.motor.electrical_power', 'W', 'firmware estimate'),
+    'mechanical_power_w': ('axis0.motor.mechanical_power', 'W', 'firmware estimate'),
 }
 RPM_SIGNALS = ('speed_rpm', 'speed_command_rpm', 'speed_setpoint_rpm')
 EXTRA_SIGNALS = ('torque_nm', 'encoder_mech_rad', 'encoder_speed_rpm', 'sensorless_speed_rpm',
@@ -89,12 +99,18 @@ CONFIG_PATHS = [
     'axis0.config.startup_encoder_offset_calibration', 'config.brake_resistor0.enable',
     'inc_encoder0.config.enabled', 'inc_encoder0.config.cpr',
 ]
+# Every allowlisted setting and the board identity are read on connect/refresh.
+CONFIG_PATHS = list(dict.fromkeys(CONFIG_PATHS + [e['path'] for e in REGISTRY] + [
+    'hw_version_major', 'hw_version_minor', 'hw_version_variant', 'bootloader_version',
+    'reboot_required', 'control_loop_hz', 'axis0.observed_encoder_scale_factor']))
+LOCKIN_SPIN = 9
 IDLE, CLOSED_LOOP, SENSORLESS = 1, 8, 4  # Documented AxisState and EncoderId.
 SENSORED_ENCODERS = {1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
-SENSORLESS_BLOCKER = ('Sensorless automatic startup is unavailable: this adapter has no verified '
-    'API marker distinguishing the open-loop ramp from observer handover. '
-    'CLOSED_LOOP_CONTROL and procedure_result alone do not prove handover. '
-    'A separately started sensorless session can be connected for read-only monitoring and recording.')
+SENSORLESS_BLOCKER = ('Sensorless start (documented as experimental in firmware 0.6.x) is automated only after '
+    'manual commissioning is confirmed, the test board is already configured for the sensorless estimator, and a '
+    'verified chain coupling lets the handover be confirmed against the sensored load encoder. The firmware '
+    'exposes no documented handover flag, so CLOSED_LOOP_CONTROL alone is never treated as proof. Feedback '
+    'switching is a manual Configuration step, never done by the test queue.')
 
 
 def installed():
@@ -210,9 +226,14 @@ def release_sync_device(device):
     run_on_loop(release_on_loop(), manager.loop)
 
 
-class HardwareController:
+class HardwareController(ConfigMixin):
+    _reader = staticmethod(_read)
+
     def __init__(self, profile=None, *, connector=None):
         self._profile = dict(DEFAULT_PROFILE)
+        self._calibration = self._backup = self._persist_expect = None
+        self._pending_handover = None
+        self._coupling_since = None
         self._connector, self._injected = connector, connector is not None
         self._discovered = None
         self._devices = {}
@@ -271,8 +292,8 @@ class HardwareController:
         self._abort_start.set()
         return self._call('disconnect', urgent=True)
 
-    def start(self, rpm, load_a, method='sensored'):
-        return self._call('start', rpm, load_a, method, self._motion_epoch)
+    def start(self, rpm, load, method='sensored', load_unit='A'):
+        return self._call('start', rpm, load, method, load_unit, self._motion_epoch)
 
     def stop(self):
         self._motion_epoch += 1
@@ -404,8 +425,13 @@ class HardwareController:
                     if _read(device,'axis0.current_state')!=IDLE or _read(device,'axis0.is_armed') is not False:raise ValueError('Board left IDLE before saving.')
                     if device.save_configuration() is not True:raise ValueError(role+': board did not confirm configuration saved.')
                     result['saved'].append(role)
-                result['state']='saved; reconnect to verify persistence'
-            else:result['state']='applied and read back; not saved to nonvolatile memory'
+                result['state']='saved; boards reboot — click Reconnect and verify'
+                expect={}
+                for change in preview['changes']:expect.setdefault(change['role'],{})[change['path']]=change['after']
+                self._persist_expect=expect
+            else:
+                result['state']='applied and read back; not saved to nonvolatile memory'
+                result['reboot_required']={r:_read(d,'reboot_required') for r,d in self._devices.items()}
         except Exception as exc:
             result['state']='partial or failed';result['error']=str(exc)
             self._error='Settings update incomplete: '+str(exc)
@@ -445,6 +471,7 @@ class HardwareController:
                         self._poll()
                         if self._owned_motion:
                             self._feed_watchdogs()
+                        self._calibration_tick()
                     except Exception as exc:
                         self._fault('Communication or control fault: '+str(exc))
                 self._publish()
@@ -465,6 +492,16 @@ class HardwareController:
                 raise ValueError(f'{key} must be true or false.')
         for key, upper in [('max_speed_rpm', 100000), ('max_load_a', 1000)]:
             p[key] = _number(p[key], key, 0, upper)
+        if p['coupling_ratio'] is not None:
+            p['coupling_ratio'] = _number(p['coupling_ratio'], 'coupling_ratio', .01, 100)
+        if isinstance(p['coupling_sign'], bool) or p['coupling_sign'] not in (-1, 1):
+            raise ValueError('coupling_sign must be +1 or -1.')
+        if not isinstance(p['coupling_verified'], bool):
+            raise ValueError('coupling_verified must be true or false.')
+        if p['coupling_verified'] and p['coupling_ratio'] is None:
+            raise ValueError('A verified coupling needs a coupling ratio.')
+        p['handover_tolerance_rpm'] = _number(p['handover_tolerance_rpm'], 'handover_tolerance_rpm', 1, 1000)
+        p['handover_hold_s'] = _number(p['handover_hold_s'], 'handover_hold_s', .2, 10)
         for key in ('test_direction', 'load_direction'):
             if isinstance(p[key], bool) or p[key] not in (-1, 1):
                 raise ValueError(f'{key} must be +1 or -1.')
@@ -555,6 +592,9 @@ class HardwareController:
                 board['firmware_unreleased'] = _read(device, 'fw_version_unreleased')
                 board['errors'] = {k: _read(device, 'axis0.'+k) for k in ('active_errors', 'disarm_reason')}
                 board['procedure_result'], board['is_armed'] = _read(device, 'axis0.procedure_result'), _read(device, 'axis0.is_armed')
+                board['faults'] = dict(active=decode_errors(board['errors']['active_errors']),
+                    disarm=decode_errors(board['errors']['disarm_reason']))
+                board['procedure'] = decode_procedure(board['procedure_result'])
                 c = board['configuration']
                 enc = c.get('axis0.config.load_encoder'), c.get('axis0.config.commutation_encoder')
                 board['feedback_method'] = 'sensorless' if enc == (SENSORLESS, SENSORLESS) else ('sensored' if all(e in SENSORED_ENCODERS for e in enc) else 'mixed / unverified')
@@ -605,9 +645,21 @@ class HardwareController:
         self._sample_id, self._acquired_at = next_id, time.perf_counter()
         if self._owned_motion:
             for role, board in next_boards.items():
-                if board['state_code'] != CLOSED_LOOP or any(v != 0 for v in board['errors'].values()):
+                allowed = (CLOSED_LOOP, LOCKIN_SPIN) if role == 'test' and self._pending_handover else (CLOSED_LOOP,)
+                if board['state_code'] not in allowed or any(v != 0 for v in board['errors'].values()):
                     raise RuntimeError(f"{role} left closed-loop control or reported errors: {board['errors']}")
-            if self._pending_load:
+            coupling = self._coupling_error(next_boards)
+            if self._pending_handover:
+                self._check_handover(next_boards, coupling)
+            elif self._profile['coupling_verified'] and coupling is not None:
+                limit = max(self._profile['handover_tolerance_rpm'], .1*abs(next_boards['test']['signals']['speed_rpm'] or 0))
+                if abs(coupling) > limit:
+                    self._coupling_since = self._coupling_since or time.perf_counter()
+                    if time.perf_counter()-self._coupling_since > 1:
+                        raise RuntimeError(f'Test and load speeds disagree by {coupling:.0f} rpm for over 1 s; possible chain slip or breakage.')
+                else:
+                    self._coupling_since = None
+            if self._pending_load and not self._pending_handover:
                 pending=self._pending_load
                 speed=next_boards['test']['signals']['speed_rpm']
                 if self._abort_start.is_set():
@@ -640,10 +692,37 @@ class HardwareController:
         prov['iq_error_a'] = dict(path='Iq_setpoint - Iq_measured', unit='A',
             kind='current-loop tracking error from firmware-filtered values', available=s['iq_error_a'] is not None)
 
-    def _readiness(self):
+    def _coupling_error(self, boards):
+        """Test-motor speed minus the speed implied by the load encoder and coupling ratio (rpm)."""
+        ratio = self._profile['coupling_ratio']
+        test, load = boards['test']['signals']['speed_rpm'], boards['load']['signals']['speed_rpm']
+        if ratio is None or test is None or load is None:
+            return None
+        return test-ratio*self._profile['coupling_sign']*load
+
+    def _check_handover(self, boards, coupling):
+        """Sensorless start: apply the speed target only after the estimate agrees with the load encoder."""
+        pending, now = self._pending_handover, time.perf_counter()
+        test = boards['test']
+        estimate = test['signals']['speed_rpm']
+        agrees = (test['state_code'] == CLOSED_LOOP and coupling is not None and estimate is not None
+            and abs(coupling) <= self._profile['handover_tolerance_rpm']
+            and abs(estimate) >= .8*self._profile['sensorless_min_rpm'])
+        if agrees:
+            pending['since'] = pending.get('since') or now
+            if now-pending['since'] >= self._profile['handover_hold_s']:
+                self._devices['test'].axis0.controller.input_vel = pending['rpm']*self._profile['test_direction']/60
+                self._pending_handover = None
+                self._stage = 'sensorless handover verified against load encoder; accelerating'
+        else:
+            pending['since'] = None
+        if self._pending_handover and now > pending['deadline']:
+            raise RuntimeError('Sensorless handover was not confirmed against the load encoder before the start-up timeout.')
+
+    def _readiness(self, method=None):
         p, checks = self._profile, []
-        def check(name, okay, detail):
-            checks.append(dict(name=name, state='pass' if okay else 'blocked', detail=detail))
+        def check(name, okay, detail, link='#configuration'):
+            checks.append(dict(name=name, state='pass' if okay else 'blocked', detail=detail, link=link))
         check('Board connections', len(self._devices)==2 and all(b['connected'] for b in self._boards.values()), 'Both configured serial numbers must be connected.')
         check('Physical roles and direction', p['roles_verified'] and p['axis_units_verified'], 'Verify board labels, axis turns equal rotor turns, and opposing-load sign for this coupling.')
         check('Local rig limits', p['max_speed_rpm']>0 and p['max_load_a']>0, 'Set validated maximum speed and load current; zero disables control.')
@@ -658,7 +737,17 @@ class HardwareController:
                 check(prefix+' fault status', all(board['errors'].get(k)==0 for k in ('active_errors','disarm_reason')), 'Active errors and disarm reason must be readable and zero.')
                 check(prefix+' motor calibration', c.get('axis0.config.motor.phase_resistance_valid') is True and c.get('axis0.config.motor.phase_inductance_valid') is True, 'Firmware resistance and inductance calibration flags must be valid.')
                 check(prefix+' encoder calibration', c.get('axis0.commutation_mapper.config.offset_valid') is True, 'Commutation-mapper offset must be valid; commission in the ODrive GUI.')
-                check(prefix+' feedback', board['feedback_method']=='sensored', 'Both feedback paths must use physical encoders. '+(SENSORLESS_BLOCKER if board['feedback_method']=='sensorless' else ''))
+                if role=='load':
+                    check(prefix+' feedback', board['feedback_method']=='sensored', 'The load motor must use a physical encoder; it is the independent speed reference.')
+                else:
+                    wanted = method or board['feedback_method']
+                    check(prefix+' feedback', board['feedback_method'] in ('sensored','sensorless') and board['feedback_method']==wanted,
+                        f"Test feedback is {board['feedback_method']}; the selected test needs {wanted}. Change it on Configuration (Encoder), then save and reconnect.")
+                    if wanted=='sensorless':
+                        check('Sensorless commissioning', p['sensorless_startup_verified'] and p['sensorless_min_rpm']>0,
+                            'Commission sensorless start manually first, then record the validated minimum speed and confirm it in Connections.', '#connections')
+                        check('Coupling for handover check', p['coupling_ratio'] is not None and p['coupling_verified'],
+                            'Enter and verify the chain coupling ratio and sign in Connections; sensorless handover is confirmed against the load encoder.', '#connections')
                 wd = c.get('axis0.config.watchdog_timeout')
                 check(prefix+' watchdog', c.get('axis0.config.enable_watchdog') is True and wd is not None and max(.5,6/p['polling_hz'])<=wd<=2, 'Preconfigure watchdog enabled, timeout >= max(0.5 s, six polling periods) and <= 2 s.')
                 control, input_mode, ramp = (2,2,'vel_ramp_rate') if role=='test' else (1,6,'torque_ramp_rate')
@@ -681,31 +770,43 @@ class HardwareController:
             control_ready=all(c['state']=='pass' for c in readiness) and self._state in ('CONNECTED','RUNNING'),
             sample_id=self._sample_id, acquired_at_s=self._acquired_at, control_stage=self._stage,
             settings_preview=copy.deepcopy(self._settings_preview),settings_result=copy.deepcopy(self._settings_result),
+            calibration=copy.deepcopy(self._calibration),calibration_info=self.calibration_info(),
+            backup=copy.deepcopy(self._backup),persist_pending=copy.deepcopy(self._persist_expect),
             source='HARDWARE', discovered=copy.deepcopy(self._discovered),
-            sensorless_start_available=False, sensorless_start_blocker=SENSORLESS_BLOCKER,
+            sensorless_start_available=bool(self._profile['sensorless_startup_verified'] and self._profile['coupling_verified'] and self._profile['sensorless_min_rpm']>0), sensorless_start_blocker=SENSORLESS_BLOCKER,
             acquisition=dict(kind='sequential host USB polling', requested_hz=self._profile['polling_hz'],
                 synchronized=False, timestamp='Host perf_counter seconds at end of each board read',
                 bandwidth_hz=None, onboard_capture='Finite buffer when compatible API and channels are present'),capture=self.capture_service.status())
         with self._lock:
             self._snapshot = result
 
-    def _do_start(self, rpm, load_a, method, epoch):
+    def _do_start(self, rpm, load, method, load_unit, epoch):
         if self.capture_service.thread and self.capture_service.thread.is_alive():raise ValueError('Wait for the previous capture download to finish.')
         if epoch!=self._motion_epoch:raise ValueError('Start cancelled by a newer Stop or Disconnect request.')
         if method not in ('sensored','sensorless'):
             raise ValueError('Feedback method must be sensored or sensorless.')
-        if method=='sensorless':
-            raise ValueError(SENSORLESS_BLOCKER)
+        if load_unit not in ('A','Nm'):
+            raise ValueError('Load unit must be A (q-axis current) or Nm (torque).')
         if self._state=='FAULT':
             raise ValueError('Resolve and explicitly clear the fault before starting again.')
         rpm = _number(rpm, 'Target rpm', .001, self._profile['max_speed_rpm'])
-        load_a = _number(load_a, 'Load current', 0, self._profile['max_load_a'])
+        if method=='sensorless' and rpm < self._profile['sensorless_min_rpm']:
+            raise ValueError(f"Sensorless tests must run at or above the validated minimum of {self._profile['sensorless_min_rpm']:g} rpm.")
+        if self._owned_motion and method!=self._boards['test'].get('feedback_method'):
+            raise ValueError('Stop before changing feedback mode.')
         for role, device in self._devices.items():
             self._boards[role]['configuration'] = self._configuration(device)
             self._boards[role]['runtime_api'] = self._runtime_api(device)
         if self._devices:
             self._poll()
-        blockers = [r['name']+': '+r['detail'] for r in self._readiness() if r['state']!='pass']
+        kt = self._boards['load']['configuration'].get('axis0.config.motor.torque_constant')
+        if not isinstance(kt,(int,float)) or kt<=0:
+            raise ValueError('Load torque constant is unavailable; the load cannot be converted safely.')
+        value = _number(load, 'Load', 0, 1e6)
+        load_a = value if load_unit=='A' else value/kt
+        if load_a > self._profile['max_load_a']:
+            raise ValueError(f"Load {value:g} {load_unit} is {load_a:.3g} A, above the validated maximum {self._profile['max_load_a']:g} A.")
+        blockers = [r['name']+': '+r['detail'] for r in self._readiness(method) if r['state']!='pass']
         if blockers:
             raise ValueError('Start blocked. '+' '.join(blockers))
         if epoch!=self._motion_epoch:raise ValueError('Start cancelled during readiness checks.')
@@ -721,18 +822,21 @@ class HardwareController:
                     axis.controller.input_torque = 0.
                 self._feed_watchdogs()
                 if epoch!=self._motion_epoch or self._abort_start.is_set():raise RuntimeError('Start cancelled before arming.')
-                test.requested_state = CLOSED_LOOP
-                if epoch!=self._motion_epoch or self._abort_start.is_set():raise RuntimeError('Start cancelled during arming.')
+                # Load first (it holds zero torque), then the test motor.
                 load.requested_state = CLOSED_LOOP
+                if epoch!=self._motion_epoch or self._abort_start.is_set():raise RuntimeError('Start cancelled during arming.')
+                test.requested_state = CLOSED_LOOP
+                sensorless = method=='sensorless'
                 deadline = time.perf_counter()+2
                 while True:
                     if self._abort_start.is_set():
                         raise RuntimeError('Start cancelled by Stop or Disconnect.')
-                    states = [_read(d,'axis0.current_state') for d in self._devices.values()]
+                    states = {r:_read(d,'axis0.current_state') for r,d in self._devices.items()}
                     errors = [_read(d,'axis0.active_errors') for d in self._devices.values()]
                     if any(error!=0 for error in errors):
                         raise RuntimeError('An axis reported an error while arming.')
-                    if states==[CLOSED_LOOP,CLOSED_LOOP]:
+                    # Sensorless: the firmware's open-loop ramp may still be running.
+                    if states['load']==CLOSED_LOOP and (states['test']==CLOSED_LOOP or (sensorless and states['test'] in (CLOSED_LOOP,LOCKIN_SPIN))):
                         break
                     if time.perf_counter()>=deadline:
                         raise RuntimeError('Both axes did not enter CLOSED_LOOP_CONTROL within 2 seconds.')
@@ -741,15 +845,21 @@ class HardwareController:
             if self._abort_start.is_set():
                 raise RuntimeError('Start cancelled.')
             starting=not self._owned_motion
-            test.controller.input_vel = rpm*self._profile['test_direction']/60
-            kt = self._boards['load']['configuration']['axis0.config.motor.torque_constant']
+            if starting and method=='sensorless':
+                # Never overwrite the firmware ramp; the target is applied once handover is confirmed.
+                self._pending_handover=dict(rpm=rpm,since=None,deadline=time.perf_counter()+self._profile['startup_timeout_s'])
+            elif self._pending_handover:
+                self._pending_handover['rpm']=rpm
+            else:
+                test.controller.input_vel = rpm*self._profile['test_direction']/60
             torque=load_a*kt*self._profile['load_direction']
             if starting or self._pending_load:
                 load.controller.input_torque=0.
                 self._pending_load=dict(rpm=rpm,torque=torque,deadline=time.perf_counter()+self._profile['startup_timeout_s'])
             else:load.controller.input_torque=torque
             self._owned_motion = True
-            self._state, self._stage, self._error = ('STARTING','accelerating; load held at zero','') if self._pending_load else ('RUNNING','closed_loop','')
+            self._state, self._stage, self._error = (('STARTING','sensorless ramp; awaiting handover confirmation','') if self._pending_handover else
+                ('STARTING','accelerating; load held at zero','') if self._pending_load else ('RUNNING','closed_loop',''))
             self._poll()
             self._feed_watchdogs()
         except Exception as exc:
@@ -769,7 +879,9 @@ class HardwareController:
                 except Exception as exc:
                     failures.append(f'{role}: {exc}')
         self._owned_motion, self._stage = False, 'coasting / torque disabled requested'
-        self._pending_load=None
+        self._pending_load=None;self._pending_handover=None;self._coupling_since=None
+        if self._calibration and self._calibration.get('state')=='running':
+            self._calibration.update(state='cancelled',detail='Stopped by operator or fault; IDLE requested.')
         return failures
 
     def _do_stop(self):

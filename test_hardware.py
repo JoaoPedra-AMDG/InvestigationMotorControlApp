@@ -261,9 +261,13 @@ class HardwareContractTests(unittest.TestCase):
         self.assertEqual(self.fixture.test.axis0.current_state,IDLE)
 
     def test_sensorless_start_rejected_without_mutation(self):
+        # Sensored board, no commissioning confirmation, no verified coupling: every
+        # sensorless prerequisite is reported and nothing is written.
         self.connect()
-        with self.assertRaisesRegex(ValueError,'observer handover'):
+        with self.assertRaisesRegex(ValueError,'Sensorless commissioning') as caught:
             self.controller.start(600,1,'sensorless')
+        self.assertIn('Coupling for handover check',str(caught.exception))
+        self.assertIn('the selected test needs sensorless',str(caught.exception))
         self.assertEqual(self.mutations(),[])
 
     def test_sensorless_externally_running_session_is_read_only(self):
