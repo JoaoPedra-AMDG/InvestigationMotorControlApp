@@ -58,13 +58,17 @@ def process_results(store,settings):
                 excluded.append({'run_id':run['id'],'reason':reason});continue
             acq=meta.get('acquisition',{});device=meta.get('device',{})
             # Do not pool different instruments, rates, bandwidths or filtering.
-            comparison={k:acq.get(k) for k in ('source','requested_hz','bandwidth_hz','filtering')}
+            comparison={k:acq.get(k) for k in ('source','bandwidth_hz','filtering')}
+            comparison['sample_hz']=acq.get('native_control_loop_hz') or acq.get('requested_hz')
             comparison.update(serial=device.get('serial') or meta.get('operator_declaration',{}).get('device_serials'),firmware=device.get('firmware') or meta.get('operator_declaration',{}).get('firmware'),calibration=meta.get('calibration',{}).get('id'),
                 instrument=meta.get('operator_declaration',{}).get('instrument'),window_start=settings.get('start_s'),window_end=settings.get('end_s'),
                 common_duration_s=common_duration if settings.get('start_s') is None and settings.get('end_s') is None else None,
                 pole_pairs=meta.get('pole_pairs') or meta.get('calibration',{}).get('pole_pairs'))
+            raw=raw_peak_to_peak(rows,config.get('start_s'),config.get('end_s'))
+            plan=run['plan'];load=plan.get('load',plan.get('load_a'));unit=plan.get('load_unit','A')
             processed.append({'run_id':run['id'],'dataset':name,'analysis_id':store.run(run['id'])['latest_review']['id'],
-                'method':run['plan']['method'],'rpm':run['plan']['rpm'],'load_a':run['plan']['load_a'],
+                'method':plan['method'],'rpm':plan['rpm'],'load':load,'load_unit':unit,'load_a':load if unit=='A' else None,
+                'test_id':plan.get('test_id',''),'raw_peak_to_peak':raw,
                 'repeat':run['plan']['repeat'],'pair_id':run['plan'].get('pair_id',run['plan_id']),
                 'peak_to_peak':metric['peak_to_peak'],'abs_peak':metric['abs_peak'],
                 'accepted':run['status']=='completed','comparison_key':json.dumps(comparison,sort_keys=True),'comparison':comparison})
@@ -72,11 +76,30 @@ def process_results(store,settings):
     # One latest successfully processed attempt per independent planned repeat.
     unique={}
     for row in processed:unique[(row['pair_id'],row['repeat'],row['method'],row['comparison_key'])]=row
-    report={'definition':'Largest peak-to-peak or absolute residual across phases A/B/C after fitted DC and fundamental removal; plotted maximum across valid independent repeats.',
+    report={'definition':'raw_peak_to_peak: largest (max - min) of the original phase A/B/C samples in the analysis window. '
+        'peak_to_peak: largest peak-to-peak residual across phases after a least-squares fit of DC + the fundamental '
+        '(speed x pole pairs) is removed. abs_peak: largest absolute residual. Each plotted point is the maximum across '
+        'valid independent repeats of the same point.',
+        'limitations':['Raw peak-to-peak includes the fundamental, so it grows with load current; it is not ripple on its own.',
+            'Residual metrics assume a constant steady-state fundamental; speed variation leaks into the residual.',
+            'Onboard capture runs at the control-loop rate, so PWM-frequency ripple is not resolved; results are not a PWM-ripple measurement.',
+            'Each board is captured on its own clock; test/load buffers are not synchronized.',
+            'Current-channel bandwidth and filtering are as declared by the operator, not measured by the app.'],
         'rows':list(unique.values()),'excluded':excluded,'settings':settings,
         'note':f'Common analysis duration: {common_duration:.6g} s. Quality-passing data; operator acceptance reported separately. Missing results remain gaps. No PWM-bandwidth claim.' if common_duration else 'No eligible phase-current captures.'}
     atomic_json(store.root/'ripple-results.json',report)
     return report
+
+
+def raw_peak_to_peak(rows,start=None,end=None):
+    """Largest max-min of the original phase-current samples inside [start, end); None if unavailable."""
+    best=None
+    for key in ('ia_a','ib_a','ic_a'):
+        values=[r[key] for r in rows if isinstance(r.get(key),(int,float)) and math.isfinite(r[key])
+            and (start is None or r['time_s']>=start) and (end is None or r['time_s']<end)]
+        if len(values)>=3:
+            spread=max(values)-min(values);best=spread if best is None else max(best,spread)
+    return best
 
 
 def results(store):
@@ -85,6 +108,6 @@ def results(store):
 
 
 def results_csv(store):
-    stream=io.StringIO(newline='');fields=['run_id','dataset','analysis_id','method','rpm','load_a','repeat','peak_to_peak','abs_peak','accepted','comparison_key']
+    stream=io.StringIO(newline='');fields=['run_id','test_id','dataset','analysis_id','method','rpm','load','load_unit','repeat','raw_peak_to_peak','peak_to_peak','abs_peak','accepted','comparison_key']
     writer=csv.DictWriter(stream,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(results(store)['rows'])
     return stream.getvalue().encode('utf-8')

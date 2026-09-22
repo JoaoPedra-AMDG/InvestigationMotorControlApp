@@ -43,8 +43,8 @@ class SnapshotFixture:
                 board['signals'].update(dc_voltage_v=48.1 if role=='test' else 48.3,
                     dc_current_a=2.5 if role=='test' else -2.,speed_rpm=1000.,position_turns=sample/10,
                     torque_nm=.4 if role=='test' else -.2,iq_a=4. if role=='test' else -2.)
-    def start(self,rpm,load_a,method):
-        self.commands.append(('start',rpm,load_a,method))
+    def start(self,rpm,load,method,load_unit='A'):
+        self.commands.append(('start',rpm,load,method));self.load_units=getattr(self,'load_units',[])+[load_unit]
         with self.lock:self.data['state']='STARTING'
         return self.snapshot()
     def stop(self):

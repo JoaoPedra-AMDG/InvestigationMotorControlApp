@@ -7,13 +7,15 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime,timezone
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit,parse_qs
 from hardware import HardwareController,DEFAULT_PROFILE
-from experiment import Store,Recorder,DEFAULT_PLAN,atomic_json,read_json
+from experiment import Store,Recorder,DEFAULT_PLAN,atomic_json,read_json,load_label
+import matrix_csv
 from import_data import import_dataset
 from signals import UNITS
 from batch_runner import BatchRunner
@@ -27,7 +29,19 @@ SCRIPTS={'app.py':'Web server, run workflow and CSV acquisition','hardware.py':'
  'capture_runtime.py':'Finite onboard capture and original per-board timestamps','batch_runner.py':'Explicit batch queue and restart recovery',
  'processing.py':'Ripple processing and load/speed comparisons','settings_support.py':'Validated board settings for troubleshooting',
  'event_log.py':'Structured JSONL log of operator commands and state changes',
- 'survey_odrive.py':'Stage 0: read-only ODrive property survey (separate command-line tool)'}
+ 'survey_odrive.py':'Stage 0: read-only ODrive property survey (separate command-line tool)',
+ 'odrive_reference.py':'Documented ODrive errors, enums and the configuration write allowlist',
+ 'hardware_config.py':'Configuration preview/apply/save, backup/restore and supervised calibration',
+ 'matrix_csv.py':'CSV test-matrix columns, validation and example'}
+
+
+def load_in_amps(plan,hardware):
+    """Plan load and load tolerance as load-motor q-axis current (A), using the board's configured Kt."""
+    unit=plan.get('load_unit','A');load=plan.get('load',plan.get('load_a'));tol=plan.get('settle_load',plan.get('settle_load_a'))
+    if unit=='A':return load,tol,None
+    kt=hardware['boards']['load'].get('configuration',{}).get('axis0.config.motor.torque_constant')
+    if not isinstance(kt,(int,float)) or kt<=0 or load is None or tol is None:return None,None,None
+    return load/kt,tol/kt,kt
 
 
 class Rig:
@@ -50,11 +64,13 @@ class Rig:
     def settled(self):
         with self.lock:
             p=self.plan();now=time.perf_counter();hold=p['settle_s'];window=[r for r in self.settle_history if now-r['host_perf_s']<=hold+.1]
-            profile=self.hardware.snapshot()['profile']
+            h=self.hardware.snapshot();profile=h['profile']
+            load_a,tol_a,_=load_in_amps(p,h)
+            if load_a is None:return False
             return bool(window and now-window[0]['host_perf_s']>=hold and now-window[-1]['host_perf_s']<.5 and
                 all(r.get('drive_rotor_rpm') is not None and r.get('load_iq_a') is not None and
                     abs(r['drive_rotor_rpm']-p['rpm']*profile['test_direction'])<=p['settle_rpm'] and
-                    abs(r['load_iq_a']-p['load_a']*profile['load_direction'])<=p['settle_load_a'] and r['state']=='RUNNING' for r in window))
+                    abs(r['load_iq_a']-load_a*profile['load_direction'])<=tol_a and r['state']=='RUNNING' for r in window))
     def status(self):
         with self.lock:
             h=self.hardware.snapshot();actual=(len(self.sample_times)-1)/(self.sample_times[-1]-self.sample_times[0]) if len(self.sample_times)>1 and self.sample_times[-1]>self.sample_times[0] else None
@@ -128,13 +144,16 @@ class Rig:
         if p.get('capture_high_rate',False):
             self.capture_preflight(p,h)
             if not self.settled():raise ValueError('High-rate steady-state capture requires settled speed and load.')
+        load_a,tol_a,kt=load_in_amps(p,h)
+        p=dict(p,load_a_equivalent=load_a,settle_load_a=tol_a,load_kt_used=kt,
+            load_definition_used=f"{load_label(p)} opposing load" + (f' = {load_a:.4g} A at Kt {kt:g} N·m/A' if kt else ''))
         self.run_zero=time.perf_counter();self.run_started_host=self.run_zero;self.sequence=0
         meta={'schema_version':3,'source':h.get('source','HARDWARE'),'software_version':'3.0.0','python_version':sys.version,
           'plan':dict(p),'devices':h['boards'],'profile':h['profile'],'calibration':h['profile'].get('calibration',{}),
           'acquisition':{'source':'HOST_TELEMETRY','requested_hz':self.rate,'bandwidth_hz':None,'filtering':'Firmware report filtering; see saved board configuration. No interpolation.',
              'synchronization':{'simultaneous':False,'method':'Sequential USB reads; each board read interval retained','uncertainty_s':None}},
           'channel_units':UNITS,'initial_conditions':self.latest,'readiness_at_start':ready,'unsettled_override':bool(allow_unsettled),
-          'load_definition':'Opposing q-axis current command in A, converted through configured load Kt to the ODrive torque input.',
+          'load_definition':'Opposing load as planned (load, load_unit). A = load-motor q-axis current; Nm = load-motor torque command. The ODrive torque input receives Nm; A is converted with the load board Kt (load_kt_used).',
           'torque_definition':'Configured Kt multiplied by firmware-reported Iq; not independently measured shaft torque.',
           'timestamp_meaning':'time_s relative to recorder start on host perf_counter clock; read intervals are absolute host clock seconds.'}
         run=self.store.create_run(p,meta);self.active_run=run['id'];self.last_file=str(self.store.run_dir(run['id'])/'telemetry.csv')
@@ -164,6 +183,9 @@ class Rig:
         for role,b in h['boards'].items():
             cap=b.get('capture',{})
             if not cap.get('available'):raise ValueError(role+': '+cap.get('detail','High-rate capture has not been verified on this board.'))
+            requested=p.get('capture_rate_hz')
+            if requested and cap.get('sample_rate_hz') and requested>cap['sample_rate_hz']*1.0001:
+                raise ValueError(f"{role}: requested capture rate {requested:g} Hz exceeds the board's native control-loop rate {cap['sample_rate_hz']:g} Hz; onboard capture cannot go faster.")
             if p['duration_s']<cap['window_s']+.1:raise ValueError('Recording duration must cover the full onboard capture window plus 0.1 seconds.')
 
     def collect_capture(self):
@@ -188,6 +210,37 @@ class Rig:
 
     def action(self,data,*,from_batch=False):
         action=data.get('action')
+        if action in ('batch_pause','batch_retry','batch_skip'):
+            with self.lock:
+                if action=='batch_pause':return self.batch.request_pause()
+                if action=='batch_retry':return self.batch.retry(data['id'])
+                return self.batch.skip(data['id'],data.get('reason',''))
+        if action=='matrix_csv_preview':
+            profile=self.hardware.snapshot()['profile']
+            with self.lock:
+                result=matrix_csv.parse(data.get('csv'),self.store.test_ids(),profile)
+                token=uuid.uuid4().hex if result['rows'] and not result['errors'] else None
+                self.csv_preview=dict(token=token,rows=result['rows'],filename=str(data.get('filename',''))[:200]) if token else None
+                return dict(result,token=token)
+        if action=='matrix_csv_save':
+            with self.lock:
+                preview=getattr(self,'csv_preview',None);self.csv_preview=None
+                if not preview or data.get('token')!=preview['token']:raise ValueError('Preview the CSV again before saving.')
+                created=self.store.import_rows(preview['rows'],preview['filename'])
+                return {'created':len(created),'ids':[p['id'] for p in created]}
+        if action in ('config_preview','config_restore_preview','config_backup','verify_persisted','calibrate'):
+            with self.lock:
+                if self.starting or self.recording or self.automated_point or self.capture_pending or self.batch.reserved():
+                    raise ValueError('Finish the active test or cancel the batch before configuring or calibrating boards.')
+            if action=='config_preview':return self.hardware.preview_config(data['changes'],'configuration page')
+            if action=='config_restore_preview':return self.hardware.preview_restore(data['backup'],data.get('allow_other_serial') is True)
+            if action=='verify_persisted':return self.hardware.verify_persisted()
+            if action=='calibrate':return self.hardware.calibrate(data['role'],data['kind'],data.get('confirmations',[]))
+            result=self.hardware.backup_config()
+            folder=self.output/'config-backups';folder.mkdir(exist_ok=True)
+            path=folder/('backup_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')+'.json')
+            with path.open('x',encoding='utf-8') as f:json.dump(result['backup'],f,indent=2,allow_nan=False)
+            result['backup_file']=str(path);return result
         if action in ('batch_start','batch_resume','batch_cancel'):
             if action=='batch_cancel':
                 with self.lock:self.batch.cancel()
@@ -262,19 +315,20 @@ class Rig:
                     if not self.selected or p['status']!='pending':raise ValueError('Select a pending test-matrix point.')
                     if p['test_type']!='steady state':raise ValueError('Use manual Apply and Record for transients, startup and minimum-speed investigations.')
                     if p.get('capture_high_rate',False):self.capture_preflight(p,self.hardware.snapshot())
-                    rpm,load_a,method=p['rpm'],p['load_a'],p['method']
+                    rpm,load,unit,method=p['rpm'],p['load'],p['load_unit'],p['method']
                 else:
-                    rpm=float(data['rpm']);load_a=float(data['load_a']);method=data['mode']
+                    rpm=float(data['rpm']);method=data['mode']
+                    load=float(data['load'] if 'load' in data else data['load_a']);unit=data.get('load_unit','A')
                     if self.automated_point:raise ValueError('Stop the selected-point workflow before applying different conditions.')
                 self.starting=True;epoch=self.command_epoch
-            try:result=self.hardware.start(rpm,load_a,method)
+            try:result=self.hardware.start(rpm,load,method,unit)
             except Exception:
                 with self.lock:self.starting=False
                 raise
             with self.lock:
                 self.starting=False
                 if epoch!=self.command_epoch:raise ValueError('Start workflow cancelled by Stop or Disconnect.')
-                self.error='';self.command,self.load,self.mode=rpm,load_a,method;self.settle_history.clear();self.event('operator_applied_conditions',{'rpm':rpm,'load_a':load_a,'method':method})
+                self.error='';self.command,self.load,self.mode=rpm,load,method;self.settle_history.clear();self.event('operator_applied_conditions',{'rpm':rpm,'load':load,'load_unit':unit,'method':method})
                 if action=='run_test':self.automated_point=True;self.run_phase='settling';self.point_start=time.perf_counter();self.position_zero={}
             return result
         with self.lock:
@@ -381,6 +435,11 @@ def make_handler(rig):
                 if u.path=='/':return self.send(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
                 if u.path in ('/workbench.js','/style.css'):return self.send(200,(ROOT/u.path[1:]).read_bytes(),'text/javascript' if u.path.endswith('.js') else 'text/css')
                 if u.path=='/api/status':return self.send(200,rig.status())
+                if u.path=='/example-test-matrix.csv':return self.send(200,matrix_csv.example_csv(),'text/csv; charset=utf-8','example-test-matrix.csv')
+                if u.path=='/api/matrix-columns':return self.send(200,[{'column':c,'unit':u_,'meaning':m} for c,u_,m in matrix_csv.COLUMNS])
+                if u.path=='/api/registry':
+                    from odrive_reference import REGISTRY
+                    return self.send(200,REGISTRY)
                 if u.path=='/api/readiness':return self.send(200,rig.readiness())
                 if u.path=='/api/scripts':return self.send(200,[{'name':n,'description':d} for n,d in SCRIPTS.items()])
                 if u.path=='/api/script':

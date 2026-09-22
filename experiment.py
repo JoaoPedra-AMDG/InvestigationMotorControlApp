@@ -46,21 +46,46 @@ def finite(value, low, high, name):
         raise ValueError(f'{name} must be between {low} and {high}.')
     return value
 
-DEFAULT_PLAN={'method':'sensored','rpm':1000.,'load_a':2.,'test_type':'steady state','repeat':1,
-              'duration_s':5.,'settle_rpm':10.,'settle_load_a':.2,'settle_s':1.,'notes':'','selected':True,'capture_high_rate':True}
+# load is the opposing load magnitude in load_unit: 'Nm' (load-motor torque command) or
+# 'A' (load-motor q-axis current). settle_load is in the same unit. load_a/settle_load_a
+# are kept only as legacy aliases for current-based plans (None for torque plans).
+DEFAULT_PLAN={'test_id':'','method':'sensored','rpm':1000.,'load':2.,'load_unit':'A','test_type':'steady state','repeat':1,
+              'duration_s':5.,'settle_rpm':10.,'settle_load':.2,'settle_s':1.,'capture_rate_hz':None,
+              'notes':'','selected':True,'capture_high_rate':True}
 TYPES=['steady state','speed change','load disturbance','startup','minimum-speed investigation']
+LOAD_UNITS=('Nm','A')
+
+def migrate_legacy(data):
+    """Plans created before load units existed stored current as load_a/settle_load_a."""
+    data=dict(data)
+    if 'load' not in data and data.get('load_a') is not None:
+        data.update(load=data['load_a'],load_unit='A')
+        if data.get('settle_load_a') is not None:data['settle_load']=data['settle_load_a']
+    return data
 
 def validate_plan(data):
+    data=migrate_legacy(data)
     p=dict(DEFAULT_PLAN,**{k:v for k,v in data.items() if k in DEFAULT_PLAN})
     if p['method'] not in ('sensored','sensorless') or p['test_type'] not in TYPES:
         raise ValueError('Unknown method or test type.')
-    for name,lo,hi in [('rpm',0,100000),('load_a',0,1000),('duration_s',.1,3600),('settle_rpm',.01,10000),('settle_load_a',.001,100),('settle_s',0,60)]:
+    if p['load_unit'] not in LOAD_UNITS:raise ValueError('Load unit must be Nm (torque) or A (current).')
+    for name,lo,hi in [('rpm',0,100000),('load',0,1000),('duration_s',.1,3600),('settle_rpm',.01,10000),('settle_load',.0001,1000),('settle_s',0,60)]:
         p[name]=finite(p[name],lo,hi,name)
+    if p['capture_rate_hz'] not in (None,''):p['capture_rate_hz']=finite(p['capture_rate_hz'],1,1e6,'capture_rate_hz')
+    else:p['capture_rate_hz']=None
     p['repeat']=int(finite(p['repeat'],1,100,'repeat'))
+    p['test_id']=str(p['test_id'] or '')[:64]
     p['notes']=str(p['notes'])[:4000]
     p['selected']=bool(p['selected'])
     if not isinstance(p['capture_high_rate'],bool):raise ValueError('High-rate capture choice must be true or false.')
+    current=p['load_unit']=='A'
+    p['load_a']=p['load'] if current else None
+    p['settle_load_a']=p['settle_load'] if current else None
     return p
+
+def load_label(p):
+    unit=p.get('load_unit','A');value=p.get('load',p.get('load_a'))
+    return f"{value:g} {'N·m' if unit=='Nm' else 'A'}" if isinstance(value,(int,float)) else 'unavailable'
 
 
 class Recorder:
@@ -113,6 +138,12 @@ class Store:
         self.lock=threading.RLock()
         self.plan_file=self.root/'plan.json'
         self.plans=read_json(self.plan_file) if self.plan_file.exists() else []
+        for plan in self.plans:
+            # Additive migration in memory; the original keys are kept.
+            if 'load' not in plan:
+                legacy=migrate_legacy(plan);plan.update(load=legacy.get('load',0.),load_unit=legacy.get('load_unit','A'),
+                    settle_load=legacy.get('settle_load',plan.get('settle_load_a',.2)))
+            plan.setdefault('test_id','');plan.setdefault('capture_rate_hz',None)
         self.recovery=[]
         for path in self.runs.glob('*/run.json'):
             try:
@@ -160,7 +191,7 @@ class Store:
                     methods=['sensored','sensorless'] if (i*4+j+repeat)%2 else ['sensorless','sensored']
                     pair=uid('pair')
                     for method in methods:
-                        p=validate_plan(dict(data,rpm=speed*speed_base,load_a=load*load_base,method=method,repeat=repeat))
+                        p=validate_plan(dict(data,rpm=speed*speed_base,load=load*load_base,load_unit=data.get('load_unit','A'),method=method,repeat=repeat))
                         p.update(id=uid('plan'),pair_id=pair,matrix_id=batch,status='pending',reason='')
                         new.append(p)
         with self.lock:self.plans.extend(new);self.save_plans()
@@ -174,6 +205,21 @@ class Store:
             else:
                 p=validate_plan(data);p.update(id=uid('plan'),pair_id=uid('pair'),status='pending',reason='');self.plans.append(p)
             self.save_plans();return p
+    def test_ids(self):
+        return {p.get('test_id') for p in self.plans if p.get('test_id')}
+    def import_rows(self,rows,source_name=''):
+        """Save validated CSV rows as pending plans; sensored/sensorless rows at the same point share a pair id."""
+        with self.lock:
+            existing=self.test_ids();batch=uid('matrix');pairs={};new=[]
+            for row in rows:
+                if row['test_id'] in existing:raise ValueError(f"test_id {row['test_id']} already exists.")
+                p=validate_plan(row)
+                key=(p['rpm'],p['load'],p['load_unit'],p['repeat'])
+                pairs.setdefault(key,uid('pair'))
+                p.update(id=uid('plan'),pair_id=pairs[key],matrix_id=batch,status='pending',reason='',source_file=str(source_name)[:200])
+                new.append(p);existing.add(p['test_id'])
+            self.plans.extend(new);self.save_plans()
+            return new
     def skip(self,ids,reason):
         if not str(reason).strip():raise ValueError('A reason is required.')
         with self.lock:
@@ -281,14 +327,14 @@ class Store:
             acq=meta.get('acquisition',{})
             comparable={k:acq.get(k) for k in ('source','requested_hz','bandwidth_hz','filtering','synchronization','ranges')}
             signature=json.dumps([comparable,review['summary']['settings'],cal],sort_keys=True)
-            key=(review['summary'].get('source',r['source']),p['method'],p['rpm'],p['load_a'],p['test_type'],signature)
+            key=(review['summary'].get('source',r['source']),p['method'],p['rpm'],(p.get('load',p.get('load_a')),p.get('load_unit','A')),p['test_type'],signature)
             # Retry attempts share a pair id; distinct matrices/manual repeats do not.
             independent_repeat=(p.get('pair_id',p['id']),p['repeat'])
             groups.setdefault(key,{})[independent_repeat]={'value':value,'run_id':r['id']}
         result=[]
         for key,repeats in groups.items():
             values=[v['value'] for v in repeats.values()]
-            result.append(dict(source=key[0],method=key[1],rpm=key[2],load_a=key[3],test_type=key[4],
+            result.append(dict(source=key[0],method=key[1],rpm=key[2],load=key[3][0],load_unit=key[3][1],load_a=key[3][0] if key[3][1]=='A' else None,test_type=key[4],
                                n=len(values),mean=statistics.mean(values),std=statistics.stdev(values) if len(values)>1 else None,
                                run_ids=[v['run_id'] for v in repeats.values()],metric=metric,group_signature=key[5]))
         return result
