@@ -38,10 +38,10 @@ has been connected during development.
 | Two boards at once | Explicit **Test Motor** / **Load Motor** roles | Implemented · Needs rig validation |
 | Configuration wizard: power supply | DC-bus overvoltage and undervoltage trips, positive and negative DC current, `max_regen_current` | Implemented (preview, apply, read back) · Needs rig validation |
 | Configuration wizard: motor | Motor type, pole pairs, torque constant, current soft and hard max, calibration current, resistance-calibration voltage, current-control bandwidth, direction | Implemented · Needs rig validation |
-| Configuration wizard: encoder | Load and commutation encoder IDs, incremental encoder enable and CPR, SPI and RS485 mode, sensorless ramp | Implemented · Needs rig validation |
+| Configuration wizard: encoder | Load and commutation encoder IDs, incremental encoder 0 enable and CPR, encoder-calibration lock-in current, sensorless ramp. SPI, RS485 and Hall encoder settings are **not** in the allowlist: their object paths on the Pro could not be confirmed without a board. Configure them in the official GUI if needed. | Implemented (incremental and sensorless only) · Needs rig validation |
 | Configuration wizard: control | Control and input mode, velocity limit and tolerance, ramps, gains, torque soft limits, torque-mode velocity limit | Implemented · Needs rig validation |
 | Watchdog configuration | Enable and timeout, range-checked against the polling rate | Implemented · Needs rig validation |
-| Thermistor limits | Motor and FET temperature limits (where the paths exist) | Implemented · Needs rig validation |
+| Thermistor limits | Motor thermistor enable and limits (`axis0.motor.motor_thermistor.config`). FET limits are not writable here. The motor and FET temperatures are displayed where readable. | Implemented · Needs rig validation (the thermistor path must be confirmed by the survey) |
 | Calibration | Supervised motor calibration, encoder offset calibration and full calibration sequence, one axis at a time, with checklist confirmation, `procedure_result` decoding and timeout-to-IDLE | Implemented · Needs rig validation |
 | Encoder direction and alignment | Encoder offset calibration determines direction and offset. Motor-direction check is a supervised observation step | Implemented · Needs rig validation |
 | Dashboard: commands and live feedback | Paired closed-loop start (test velocity, load torque held at zero until speed), load set and zero, Stop Both | Implemented · Needs rig validation |
@@ -58,3 +58,8 @@ has been connected during development.
 | Live plotting | Monitoring page plots from host polling (clearly labelled). High-rate data only from onboard capture | Implemented · Needs rig validation |
 | Sensorless start | Allowed only when the test board is already set up for sensorless and the operator has confirmed commissioning. The switch to closed loop is confirmed against the sensored load encoder via the coupling ratio before load is applied. Changing the feedback source stays a manual Configuration step. | Implemented · Needs rig validation (firmware calls sensorless experimental) |
 | Simulation mode | Not in the delivered app (a requirement). Test fixtures are only used by the automated tests. | Removed |
+| *(added)* Test Matrix page | CSV import and validation, explicit N·m / A loads, visual speed × load matrix, run, pause, retry, skip, cancel, readiness links | Implemented · Needs rig validation |
+| *(added)* Motor Monitoring page | Two columns with live values and graphs, window, visibility, pause, display-only zero | Implemented · Needs rig validation |
+| *(added)* Recording and results | Separate acquisition; host CSV plus onboard capture metadata; raw and residual ripple plots per load | Implemented · Needs rig validation |
+
+See `docs/VALIDATION_CHECKLIST.md` for the per-feature validation status and the first-connection order.

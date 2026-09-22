@@ -15,3 +15,17 @@ table.kv th{position:static;width:48%;background:none;font-weight:550;color:#4b5
 table.kv tr.alert td{color:#a23d30;font-weight:650}
 .cfg-group{margin:18px 0 6px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#806646;font-family:system-ui,sans-serif}
 @media(max-width:850px){.stop-group{align-items:flex-start;margin-left:0}}
+
+/* Configuration status tags, matrix feedback styles, faults and monitoring controls. */
+.tag{display:inline-block;padding:2px 7px;margin:2px 6px 2px 0;font-size:11px;border-radius:2px;border:1px solid transparent;white-space:nowrap}
+.tag-read{background:#eef2f5;color:#35505f;border-color:#c9d6de}.tag-unsaved{background:#fff3d6;color:#7a5200;border-color:#e2bf6b}
+.tag-written{background:#e7eefb;color:#2f4f86;border-color:#a9bde3}.tag-saved{background:#e3f1e6;color:#2f6a3c;border-color:#9ccaa6}
+.cfg-table th{position:static;background:none;font-weight:550;width:42%}.cfg-table thead th{background:#f0eee5}.cfg-table input,.cfg-table select{margin:0;padding:6px 8px}
+.matrix-point.method-sensored{border-left:4px solid #28685e}
+.matrix-point.method-sensorless{border-left:4px dashed #a76b31;background-image:repeating-linear-gradient(135deg,transparent 0 8px,#a76b3112 8px 16px)}
+.matrix-point span{font-size:10px}.legend-tile{display:inline-block;padding:4px 10px;font-size:11px}
+.matrix-point.blocked{background:#fbeee3;border-color:#b86b2e}.matrix-point.settling{background:#eef1f8}.matrix-point.completed{background:#eaf2e8}
+ul.faults{margin:8px 0;padding-left:18px;color:#8a3429}ul.faults li{margin:6px 0;line-height:1.5}
+.monitor-tools{align-items:center}.mon-visible{border:1px solid #d8d4c9;padding:6px 12px;display:flex;flex-wrap:wrap;gap:4px 14px}.mon-visible legend{font-size:12px;color:#63665f}.mon-visible label{margin:0}
+.monitor-status table{margin-bottom:8px}#current-test{font-weight:600;color:#28685e}
+.monitor-tools>label{flex:0 0 170px}.cfg-table select{min-width:120px}

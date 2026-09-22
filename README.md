@@ -113,23 +113,66 @@ If the `py` launcher is unavailable, replace `py -3` with the full path to `pyth
 
 ## Pages
 
-Use the horizontal menu bar to move between these views:
+The horizontal menu bar spans the top of every page and stays visible while scrolling. **Stop Both Motors**, on the right, requests IDLE on both boards: torque is removed and the motors coast. It is a software command. It does not brake and is **not an emergency stop**.
 
 | Page | Purpose |
 | --- | --- |
-| Home | Operating sequence and explanation of the controls, signals and recording limits. |
-| Dashboard | Both motors side by side: axis state, control/input mode, speed reference and measured, speed error (velocity control only), Iq reference/measured/tracking error, Id, Kt × Iq torque estimate, selected-feedback and sensorless estimates, DC bus voltage/current/power, temperatures, errors, recording state and elapsed time, plus 30 s live plots. Read-only in this version. |
-| Configuration | Discover ODrives on USB by serial number without connecting, assign drive/load roles, and view each board's configuration read from the board, grouped as motor, encoder, control, DC bus, start-up and sensorless ramp. Read-only in this version. |
-| Motors | Test motor in the left column and load motor in the right column; each shows DC voltage, DC current, rotor speed, rotor position and torque. |
-| Test matrix | Select a tile and Run selected, or Run all selected tests; watch progress on the matrix. |
-| Troubleshooting | Diagnose local limits, watchdogs and controller modes; preview, apply and read back supported settings while idle. |
-| Python scripts | Read the actual source files that implement the application. Viewing source never executes it. |
-| Connections | Assign both serial numbers, save the validated profile, explicitly connect, inspect states/readiness and disconnect. |
-| Review and export | Process ripple results, switch metrics, compare feedback modes at each load and export results CSV or raw run ZIPs. |
+| Home | Operating sequence and safety notes. |
+| Dashboard | Both motors side by side: state, modes, speed and Iq reference vs measured with tracking errors, Id, estimated torque (firmware estimate and Kt × Iq), DC voltage, current and power, temperatures, decoded faults, recording state and elapsed time, with live plots. Motor commands: start/apply a test speed and an opposing load in N·m or A, set the load to zero, stop both. |
+| Motor Monitoring | Test motor on the left, load motor on the right. For each: DC voltage, DC current, speed, position in mechanical revolutions from a display zero, estimated torque and phase currents A/B/C, as values and time series. Also connection, axis state, feedback mode, faults, units and data age. Time window, graph visibility, pause/resume display, and Zero Displayed Position (display only). |
+| Test Matrix | CSV upload → preview and validation → save; example CSV and column reference. Readiness with links to the setting behind each blocker. Visual speed × load matrix with sensored and sensorless tiles styled differently. Run Selected Test, Run All Selected Tests, Pause After Current Test, Resume, Stop Both Motors and Cancel, Retry and Skip. Per-point status (pending, settling, recording, completed, blocked, failed, skipped) and overall progress. |
+| Results | Process steady-state captures. For each load, current ripple vs speed with separate sensored and sensorless lines, and a selector for raw peak-to-peak or fitted-fundamental residual peak-to-peak. Export CSV and full run ZIPs. |
+| Configuration | Discover boards and assign roles. Identity, firmware and decoded faults. Allowlisted settings editor (preview → apply with read-back → optional save → reconnect and verify). Supervised calibration. Configuration backup and restore. |
+| Connections | Serial numbers, validated rig limits, directions, chain coupling, sensorless confirmation; explicit connect and disconnect; readiness. |
+| Troubleshooting | Quick fixes for local limits, watchdogs and controller modes. |
+| Python scripts | Read the source files that implement the application. Viewing never runs them. |
+| Compare repeats | Statistics across independent repeats. |
 
-**Stop both · coast** in the menu bar is on every page. It requests IDLE on both boards, so both motors coast. It is a software command and is not the emergency stop.
+Earlier analysis history is kept. Historical records keep their original acquisition-source tags.
 
-Repeat comparisons and earlier analysis history remain available. Historical records retain their original acquisition-source tags; they are not relabelled as hardware experiments.
+## Test matrix CSV
+
+Download the example from the Test Matrix page (`/example-test-matrix.csv`). Columns:
+
+| Column | Unit | Meaning |
+| --- | --- | --- |
+| `test_id` | text | Unique name (letters, digits, `-`, `_`). |
+| `feedback_mode` | — | `sensored` or `sensorless` (test motor). The load motor is always sensored. |
+| `speed_rpm` | rpm | Test-motor speed setpoint, mechanical. |
+| `load` | N·m or A | Opposing load magnitude, in `load_unit`. |
+| `load_unit` | `Nm` or `A` | `Nm` = load-motor torque command. `A` = load-motor q-axis current (torque = Kt × current). |
+| `settle_time_s` | s | Time the point must stay inside tolerance before recording. |
+| `speed_tolerance_rpm` | rpm | Allowed speed deviation. |
+| `load_tolerance` | as `load_unit` | Allowed load deviation. |
+| `record_duration_s` | s | Steady-state recording length. |
+| `capture_rate_hz` | Hz | Requested high-rate capture rate; blank = native. Onboard capture only runs at the board's control-loop rate. A higher request is rejected, and the actual rate is always recorded. |
+| `repeat` | count | Repeat number of the same point. |
+| `notes` | text | Optional. |
+
+Validation reports errors row by row. Rig-limit problems appear as warnings and are enforced again, against the connected boards, before every test. The validated maximum load on Connections is in A, so torque loads are converted with the load board's configured Kt, and the Kt used is recorded with each run.
+
+## Recording and results
+
+- The live display is separate from acquisition. The browser refresh rate never sets the recording rate.
+- Host telemetry (`telemetry.csv`) is **sequential USB polling**, not high-rate or synchronized acquisition. Actual host timestamps, per-board read intervals and dropped samples are recorded.
+- High-rate steady-state data uses the documented ODrive onboard oscilloscope through `odrive.utils.high_rate_capture`. It runs at the board's native control-loop rate with no decimation, into a finite buffer per board.
+  - Each dataset's JSON records the requested and native rate, actual rate, dropped samples, the declared channel bandwidth and filtering, within-board timing quantisation, and `boards_share_clock: false`.
+  - The two boards are not synchronized.
+- Raw data is CSV and metadata is JSON. The metadata includes board serials, firmware, configuration, feedback mode, the matrix point with its load unit and the Kt used, units, calibration references and capture settings.
+- Runs are never overwritten, and interrupted or failed runs are kept and labelled.
+- **Ripple metrics.** *Raw peak-to-peak* is the largest (max − min) of the original phase A/B/C samples in the analysis window. It includes the fundamental, so it grows with load current. *Residual peak-to-peak* is the largest phase peak-to-peak after a least-squares fit of DC plus the fundamental (speed × pole pairs) is removed.
+- **Limitations.**
+  - A constant steady-state fundamental is assumed.
+  - Control-loop-rate capture cannot resolve PWM-frequency ripple.
+  - Channel bandwidth is as declared by the operator.
+  - Unavailable metrics are reported as unavailable, never filled in.
+
+## Dependencies and compatibility
+
+- Python 3.10 or newer. Tested with Python 3.13.14 on Windows 11.
+- `requirements.txt`: `numpy>=1.24,<3`, `odrive==0.6.11.post1`. `requirements-lock.txt` lists the exact versions the tests passed with (numpy 2.5.3, odrive 0.6.11.post1 and its dependencies).
+- Firmware: released ODrive Pro firmware 0.6.x, 0.6.10 or newer, the same on both boards. Written against the 0.6.12 documentation. See `docs/REFERENCE_REVIEW.md` for what was checked, what the app supports, and what it deliberately leaves out (firmware flashing, Inspector-style unrestricted writes, CAN/UART/GPIO features).
+- Before relying on the app with real boards, run the read-only property survey (next section) on each board and resolve any missing properties.
 
 ## Stage 0: read-only property survey
 
@@ -155,7 +198,7 @@ Every command sent to `/api/command` (request, then accepted/rejected/failed) an
 
 ## Commissioning before the first connection
 
-Commission both motors individually using the ODrive GUI, save their configurations, and release the GUI's USB connections before connecting this application. The application does not flash firmware, calibrate motors, change encoder routing. The Troubleshooting page can explicitly update and optionally save the allowlisted watchdog, controller-mode, ramp and zero-setpoint settings.
+Commission each motor on the Configuration page (or in the official ODrive GUI; close it before connecting here). Configure the power limits, motor, encoder and control modes; run motor calibration and then encoder offset calibration; do the hand-turn direction check; save to the boards. The application does not flash firmware.
 
 The current adapter checks these requirements before allowing motion:
 
@@ -166,7 +209,7 @@ The current adapter checks these requirements before allowing motion:
 - Firmware motor-current and velocity limits that are readable, positive and compatible with the selected point.
 - Test drive already configured for `VELOCITY_CONTROL`, `VEL_RAMP` and a positive velocity ramp rate.
 - Load drive already configured for `TORQUE_CONTROL`, `TORQUE_RAMP`, a positive torque ramp rate and a readable positive torque constant.
-- Sensored feedback on the load drive. This version starts sensored sessions only; sensorless sessions are read-only monitoring/recording.
+- Sensored feedback on the load drive. The test drive must already be configured for the selected feedback mode (the queue never switches it). Sensorless additionally needs the commissioning confirmation, a validated minimum speed, and a verified chain coupling.
 - An enabled onboard watchdog on each board with a timeout of at least max(0.5 seconds, six polling periods) and no more than 2 seconds. The application feeds it while it owns active motion.
 - A verified stop procedure. This implementation supports only requesting `IDLE` to disable torque on both drives, allowing the rig to coast.
 - Both boards initially idle, with readable zero active errors and disarm reasons.
@@ -189,7 +232,7 @@ Match the actual motor voltage/current limits, regeneration handling, mechanical
 
 Manual condition application and recording are separate controls where provided. Ending a manual recording does not itself promise a mechanical stop: use Stop and inspect the rig. Closing the browser does not stop the Python application, active workflow or recording. Ending the Python application requests the supported stop; if communications fail, the application cannot guarantee delivery and reports the fault.
 
-Sensorless Start is currently blocked because the adapter has no verified firmware marker separating the open-loop ramp from observer handover. Commissioning flags do not override that restriction. A separately started sensorless session may be connected for read-only monitoring and manual recording; the app does not feed the watchdog for motion it does not own. Sensorless tests require separately validated startup, handover, minimum speed and stopping behavior for the exact firmware and rig. Selecting a sensorless matrix point does not reconfigure a commissioned sensored drive. Follow the current readiness restriction; unsupported sensorless startup remains blocked rather than being approximated by a speed ramp.
+Sensorless start follows the documented firmware workflow: with both encoders set to the sensorless estimator, requesting closed loop runs the open-loop `sensorless_ramp`, then the firmware switches to closed loop. The firmware exposes no documented flag for that handover, and 0.6.x documents sensorless mode as experimental. So the app never overwrites the ramp's velocity input, and only applies the test speed target (and later the load) after the sensorless speed estimate has agreed with the load encoder, through the verified coupling ratio, for the configured hold time. If that doesn't happen before the start-up timeout, both motors are stopped. This must be validated on the rig before sensorless data is trusted.
 
 ## What the plots mean
 
@@ -220,7 +263,7 @@ The feature must still be checked on the actual installed firmware and USB setup
 
 Open **Configure tests** to generate paired speed/load points or edit the included subset. Select a tile, then **Run selected**, or press **Run all selected tests** once to queue all included pending points. The Python process runs the queue independently of the browser. Each point settles, records, coasts to IDLE, and waits until both reported speeds are below 5 rpm before the next start. A fault, incomplete acquisition, unsupported feedback mode or missing capability pauses the queue with a reason. Stop cancels pending work. An application restart never resumes motion automatically.
 
-Feedback routing is never switched by the queue. Automatic sensorless startup remains blocked; a mixed queue pauses at such a point. Independently commissioned and already running sensorless sessions can be manually recorded using a selected sensorless plan, or imported from an external acquisition. A recorded tile means acquisition finished, not that an operator has accepted the result.
+Feedback routing is never switched by the queue: a point whose feedback mode differs from the test board's current configuration is blocked, with a link to Configuration. Pause After Current Test lets the running point finish, then pauses the queue. A failed point pauses the queue, and it resumes only after each failed point is retried (as a new attempt, keeping the failed run) or skipped with a reason. A completed tile means acquisition finished, not that an operator has accepted the result.
 
 ## Processing current ripple
 
@@ -228,8 +271,9 @@ Feedback routing is never switched by the queue. Automatic sensorless startup re
 
 The metric selector offers:
 
-- **Peak-to-peak:** `max over A/B/C of (max residual - min residual)` in amperes.
-- **Absolute peak:** `max over A/B/C of max(abs(residual))` in amperes.
+- **Raw peak-to-peak:** `max over A/B/C of (max sample - min sample)` of the original phase currents in amperes (includes the fundamental).
+- **Residual peak-to-peak:** `max over A/B/C of (max residual - min residual)` in amperes after the DC + fundamental fit.
+- The absolute-peak residual is still calculated and exported in the CSV.
 
 Each load graph has separate sensored and sensorless lines against rpm. A point is the maximum across valid independent repeats; the results table and CSV retain both metrics for each repeat. Retried attempts count once (latest valid attempt). Different acquisition sources, rates, bandwidths, filtering, device identities, calibration or analysis windows remain separate groups. Missing data remains gaps. Operator acceptance is displayed separately from numerical quality checks; process again after changes to runs/reviews.
 
@@ -251,7 +295,7 @@ Unknown bandwidth/filtering, missing phase currents, timing gaps, clipping, part
 - `event_log.py`: JSONL command and state-change log.
 - `recordings/connection-profile.json`: explicitly saved local profile.
 
-Run `python -m unittest discover -p 'test_*.py'` using the local environment for automated checks. Test fixtures exercise disconnected behavior, command validation and data handling without connecting physical boards. Passing them does not validate actual motor control, sensorless handover, USB timing, emergency stopping or measurement accuracy.
+Run `.venv\\Scripts\\python.exe -m unittest` for the automated checks (matrix validation, sequencing, recording, fault handling, configuration updates, calibration guards, sensorless handover). The tests use `fixture_boards.py` only. Test fixtures exercise disconnected behavior, command validation and data handling without connecting physical boards. Passing them does not validate actual motor control, sensorless handover, USB timing, emergency stopping or measurement accuracy.
 
 Official references for commissioning and API details:
 
